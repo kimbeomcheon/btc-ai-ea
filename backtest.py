@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V7 Proactive Market-Risk Backtester
+BTC AI EA — V7.1 Proactive Market-Risk Backtester
 ==============================================
 
 Why V7 exists
@@ -467,11 +467,24 @@ def trade_cost(delta_notional: float, costs: CostModel) -> float:
 def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules,
              initial: float = 10_000.0, signal_delay_bars: int = 1,
              tactical_enabled: bool = True, enforce_hard_stop: bool = True,
-             market_risk_enabled: bool = True, hysteresis_enabled: bool = True):
+             market_risk_enabled: bool = True, hysteresis_enabled: bool = True,
+             trade_start: pd.Timestamp | None = None):
     x = build_features(df1h, s).dropna(
         subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid",
                 "risk_slow", "ret20", "dd20"]
     )
+    # Walk-forward OOS windows need pre-test history to warm slow daily
+    # indicators, but portfolio PnL/risk state must start fresh at the OOS
+    # boundary. Build features on the warm-up slice, then discard all bars
+    # before trade_start. This fixes the V7 one-year OOS failure where a
+    # 250-day slow regime left fewer than 1,500 usable 4H bars.
+    if trade_start is not None:
+        t0 = pd.Timestamp(trade_start)
+        if t0.tzinfo is None:
+            t0 = t0.tz_localize("UTC")
+        else:
+            t0 = t0.tz_convert("UTC")
+        x = x.loc[x.index >= t0]
     if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
 
@@ -799,6 +812,11 @@ def walk_forward(data, costs, rules, initial):
         test_end=anchor+pd.DateOffset(years=4)-pd.Timedelta(hours=1)
         train=data.loc[(data.index>=anchor)&(data.index<=train_end)]
         test=data.loc[(data.index>=test_start)&(data.index<=test_end)]
+        # Keep a 600-day pre-test warm-up solely for feature construction.
+        # backtest(..., trade_start=test_start) resets account state at the
+        # OOS boundary, so no warm-up PnL leaks into the test metrics.
+        warmup_start = max(data.index.min(), test_start - pd.Timedelta(days=600))
+        test_warm = data.loc[(data.index>=warmup_start)&(data.index<=test_end)]
         if len(train)<15000 or len(test)<4000:
             anchor += pd.DateOffset(years=1); continue
 
@@ -810,9 +828,15 @@ def walk_forward(data, costs, rules, initial):
         scored.sort(key=lambda z:(z[0], z[1]), reverse=True)
         _, _, chosen, tm = scored[0]
 
-        seq,str_,sev,sex=backtest(test,chosen,costs,rules,initial,enforce_hard_stop=False)
+        seq,str_,sev,sex=backtest(
+            test_warm, chosen, costs, rules, initial,
+            enforce_hard_stop=False, trade_start=test_start
+        )
         sm=metrics(seq,str_,sex,initial)
-        req,rtr,rev,rex=backtest(test,chosen,costs,rules,initial,enforce_hard_stop=True)
+        req,rtr,rev,rex=backtest(
+            test_warm, chosen, costs, rules, initial,
+            enforce_hard_stop=True, trade_start=test_start
+        )
         rm=metrics(req,rtr,rex,initial)
 
         rows.append({
