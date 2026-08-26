@@ -1,0 +1,28 @@
+{
+  "project": "BTC AI EA Phase 1",
+  "initial_capital_usd": 10000,
+  "data_start": "2017-08-17",
+  "timeframes": {
+    "regime": "4h",
+    "entry": "1h"
+  },
+  "risk": {
+    "campaign_risk_pct": 0.005,
+    "notional_cap": 1.0,
+    "daily_loss_lock": 0.02,
+    "weekly_loss_lock": 0.05,
+    "soft_drawdown": 0.1,
+    "hard_drawdown": 0.15
+  },
+  "costs": {
+    "fee_bps_per_fill": 5.5,
+    "slippage_bps_per_fill": 2.0
+  },
+  "excluded_phase1": [
+    "martingale",
+    "averaging_down",
+    "simultaneous_long_short",
+    "altcoins",
+    "news_as_direct_entry_signal"
+  ]
+}
