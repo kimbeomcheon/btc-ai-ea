@@ -1,44 +1,50 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V7.3 Downside-Risk Filter Backtester
-================================================
+BTC AI EA — V8.0 Derivatives-Risk Filter Backtester
+===================================================
 
-Why V7.3 exists
----------------
-V7.1 produced the strongest research engine so far, but its best candidate
-(V7D_STICKY) still suffered roughly 27% shadow drawdown. V7.2 showed that
-symmetric realized-volatility caps reduce upside and drawdown together without
-solving the 15% risk target. V7.3 therefore returns to the V7.1D engine and adds
-an orthogonal DOWNSIDE-ONLY risk layer.
+Why V8 exists
+-------------
+V7.1/V7.3 produced a durable long-only BTC return engine, but price-only risk
+filters repeatedly stalled around ~25-27% shadow drawdown. V8 freezes the
+V7.1D_STICKY return engine and adds an orthogonal derivatives/microstructure
+risk layer instead of further tuning price thresholds.
 
 Architecture
 ------------
 1) CORE: V7.1D_STICKY slow daily bull-trend exposure, frozen across candidates.
-2) TACTICAL: V7.1D_STICKY 4H breakout sleeve, long only, also frozen.
+2) TACTICAL: V7.1D_STICKY 4H breakout sleeve, long only, frozen.
 3) PROACTIVE MARKET RISK: unchanged V7.1 trend/momentum/shock state machine.
-4) DOWNSIDE FILTER: 10/30-day downside semivolatility, downside-vol expansion,
-   3/5-day negative momentum and 10-day peak drawdown velocity.
-5) HYSTERESIS: worsening is immediate; recovery is delayed and stepwise.
-6) CIRCUIT BREAKERS: daily/weekly loss locks plus a separate 15% terminal
-   research gate. The terminal gate never drives ordinary shadow sizing.
+4) DERIVATIVES RISK: Binance USD-M BTCUSDT funding, premium-index basis proxy,
+   open-interest value and taker buy/sell pressure.
+5) DELEVERAGING PROXY: sharp OI contraction + negative spot momentum + weak
+   taker ratio; this is used instead of incomplete liquidation archives.
+6) HYSTERESIS: worsening is immediate; recovery is delayed and stepwise.
+7) CIRCUIT BREAKERS: daily/weekly loss locks plus separate 15% terminal research
+   gate. The terminal gate never drives ordinary shadow sizing.
 
-The V7.3 candidates differ ONLY in downside-filter thresholds/scales. This keeps
-V7.1D_STICKY's return engine fixed and isolates whether asymmetric downside risk
-control improves the CAGR/MDD frontier.
+V8 candidates differ ONLY in derivatives thresholds/scales. The return engine
+and V7.1 price-risk overlay are held fixed so the test isolates whether
+orthogonal positioning data improves the CAGR/MDD frontier.
 
 Anti-lookahead rules
 --------------------
-- Daily features use only a fully completed prior daily candle.
-- 4H tactical signals use only a fully completed prior 4H candle.
+- Daily spot and derivatives features are labeled at the NEXT UTC midnight.
+- Only fully completed daily/4H observations are available to a signal.
 - Rebalances execute at a later 4H OPEN.
-- Walk-forward windows receive warm-up history for indicators only; PnL starts
+- Walk-forward warm-up may initialize indicators, but PnL/risk state starts
   fresh at the OOS boundary.
 
-Phase-1 price source
---------------------
-Binance BTCUSDT spot 1H public archives are used as a long-history PRICE proxy.
-Funding, basis, liquidation and perpetual-specific microstructure remain deferred
-to later futures validation.
+Data / research integrity
+-------------------------
+- Spot price proxy: Binance BTCUSDT spot 1H public archives (2017+).
+- Funding / premium index: official Binance USD-M public archives (2020+).
+- Open-interest/taker metrics: official Binance USD-M daily metrics archives
+  (coverage begins around Sep-2020; missing observations are never backfilled
+  from the future).
+- Binance USD-M liquidationSnapshot history is incomplete after 2024-03, so it
+  is NOT used as a trading feature. ETF flows are also not used in V8.0 because
+  the history starts only in 2024 and would create a short, inconsistent sample.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +65,7 @@ import numpy as np
 import pandas as pd
 
 BINANCE_VISION = "https://data.binance.vision/data/spot"
+BINANCE_FUTURES = "https://data.binance.vision/data/futures/um"
 KLINE_COLS = [
     "open_time", "open", "high", "low", "close", "volume", "close_time",
     "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
@@ -90,6 +98,19 @@ class Strategy:
     down_scale_warn: float
     down_scale_high: float
     down_recovery_days: int
+    deriv_funding_z_warn: float
+    deriv_funding_z_high: float
+    deriv_premium_z_warn: float
+    deriv_premium_z_high: float
+    deriv_oi7_warn: float
+    deriv_oi7_high: float
+    deriv_oi1_drop_high: float
+    deriv_taker_warn: float
+    deriv_taker_high: float
+    deriv_scale_warn: float
+    deriv_scale_high: float
+    deriv_scale_panic: float
+    deriv_recovery_days: int
     risk_fast_days: int
     risk_mid_days: int
     risk_slow_days: int
@@ -104,63 +125,84 @@ class Strategy:
 
 
 CANDIDATES = [
-    # V7.1D_STICKY engine is frozen. Only downside thresholds/scales vary.
+    # V7.1D_STICKY return engine and price-risk overlay are frozen.
+    # Only derivatives-risk thresholds/scales vary.
     Strategy(
-        "V73A_MILD",
+        "V8A_MILD",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.26,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.98,
-        down_sv_warn=0.72, down_sv_high=1.00,
-        down_ratio_warn=1.35, down_ratio_high=1.85,
-        down_dd10_warn=-0.085, down_dd10_high=-0.135, down_ret3_high=-0.085,
-        down_scale_warn=0.86, down_scale_high=0.48, down_recovery_days=2,
+        down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
+        down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
+        down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
+        deriv_funding_z_warn=1.25, deriv_funding_z_high=2.20,
+        deriv_premium_z_warn=1.20, deriv_premium_z_high=2.10,
+        deriv_oi7_warn=0.14, deriv_oi7_high=0.26, deriv_oi1_drop_high=-0.12,
+        deriv_taker_warn=0.94, deriv_taker_high=0.86,
+        deriv_scale_warn=0.84, deriv_scale_high=0.50, deriv_scale_panic=0.10,
+        deriv_recovery_days=2,
         risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
         mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V73B_BALANCED",
+        "V8B_BALANCED",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.26,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.98,
-        down_sv_warn=0.62, down_sv_high=0.90,
-        down_ratio_warn=1.25, down_ratio_high=1.65,
-        down_dd10_warn=-0.075, down_dd10_high=-0.120, down_ret3_high=-0.075,
-        down_scale_warn=0.78, down_scale_high=0.32, down_recovery_days=3,
+        down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
+        down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
+        down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
+        deriv_funding_z_warn=1.00, deriv_funding_z_high=1.80,
+        deriv_premium_z_warn=1.00, deriv_premium_z_high=1.75,
+        deriv_oi7_warn=0.11, deriv_oi7_high=0.22, deriv_oi1_drop_high=-0.10,
+        deriv_taker_warn=0.95, deriv_taker_high=0.88,
+        deriv_scale_warn=0.76, deriv_scale_high=0.36, deriv_scale_panic=0.00,
+        deriv_recovery_days=3,
         risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
         mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V73C_DEFENSIVE",
+        "V8C_DEFENSIVE",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.26,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.98,
-        down_sv_warn=0.55, down_sv_high=0.80,
-        down_ratio_warn=1.18, down_ratio_high=1.50,
-        down_dd10_warn=-0.065, down_dd10_high=-0.105, down_ret3_high=-0.065,
-        down_scale_warn=0.70, down_scale_high=0.20, down_recovery_days=3,
+        down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
+        down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
+        down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
+        deriv_funding_z_warn=0.80, deriv_funding_z_high=1.55,
+        deriv_premium_z_warn=0.80, deriv_premium_z_high=1.50,
+        deriv_oi7_warn=0.09, deriv_oi7_high=0.18, deriv_oi1_drop_high=-0.085,
+        deriv_taker_warn=0.97, deriv_taker_high=0.90,
+        deriv_scale_warn=0.68, deriv_scale_high=0.24, deriv_scale_panic=0.00,
+        deriv_recovery_days=4,
         risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
         mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V73D_STICKY_DOWNSIDE",
+        "V8D_STICKY",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.26,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.98,
-        down_sv_warn=0.64, down_sv_high=0.90,
-        down_ratio_warn=1.22, down_ratio_high=1.60,
-        down_dd10_warn=-0.075, down_dd10_high=-0.115, down_ret3_high=-0.072,
-        down_scale_warn=0.80, down_scale_high=0.28, down_recovery_days=5,
+        down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
+        down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
+        down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
+        deriv_funding_z_warn=0.95, deriv_funding_z_high=1.75,
+        deriv_premium_z_warn=0.95, deriv_premium_z_high=1.70,
+        deriv_oi7_warn=0.10, deriv_oi7_high=0.20, deriv_oi1_drop_high=-0.095,
+        deriv_taker_warn=0.96, deriv_taker_high=0.89,
+        deriv_scale_warn=0.78, deriv_scale_high=0.32, deriv_scale_panic=0.00,
+        deriv_recovery_days=5,
         risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
         mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
@@ -183,7 +225,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v7.3/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v8.0/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -281,6 +323,262 @@ def download_btc_1h(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
     return x
 
 
+
+
+def _read_zip_csv_flexible(raw: bytes) -> pd.DataFrame:
+    """Read one Binance Vision ZIP member and tolerate header/no-header formats."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        name = next(n for n in z.namelist() if n.endswith('.csv'))
+        payload = z.read(name)
+    probe = pd.read_csv(io.BytesIO(payload), nrows=2, header=None)
+    first = ' '.join(str(x) for x in probe.iloc[0].tolist()).lower()
+    has_header = any(k in first for k in (
+        'open_time','calc_time','create_time','funding','symbol','sum_open_interest'
+    ))
+    return pd.read_csv(io.BytesIO(payload), header=0 if has_header else None)
+
+
+def _to_utc_index(s: pd.Series) -> pd.DatetimeIndex:
+    # Metrics create_time can be an ISO string; funding is usually epoch ms.
+    # Never let pandas interpret millisecond integers as nanoseconds.
+    numeric = pd.to_numeric(s, errors='coerce')
+    if numeric.notna().mean() >= 0.8 and numeric.notna().any():
+        med = numeric.dropna().median()
+        unit = 'us' if med > 1e14 else 'ms' if med > 1e11 else 's'
+        dt = pd.to_datetime(numeric, unit=unit, utc=True, errors='coerce')
+    else:
+        dt = pd.to_datetime(s, utc=True, errors='coerce')
+    return pd.DatetimeIndex(dt)
+
+
+def _completed_months(start_ts: pd.Timestamp, end_ts: pd.Timestamp):
+    now = pd.Timestamp.now(tz='UTC')
+    last_complete = pd.Timestamp(now.year, now.month, 1, tz='UTC') - pd.Timedelta(days=1)
+    if start_ts > min(end_ts, last_complete):
+        return []
+    return list(_month_starts(start_ts, min(end_ts, last_complete)))
+
+
+def download_funding_daily(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    start_ts = max(pd.Timestamp(start, tz='UTC'), pd.Timestamp('2020-01-01', tz='UTC'))
+    end_ts = pd.Timestamp(end, tz='UTC')
+    frames = []
+    for m in _completed_months(start_ts, end_ts):
+        ym = m.strftime('%Y-%m')
+        p = cache_dir / f'BTCUSDT-fundingRate-{ym}.zip'
+        url = f'{BINANCE_FUTURES}/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-{ym}.zip'
+        if not p.exists():
+            try:
+                p.write_bytes(_fetch_bytes(url))
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                raise
+        try:
+            df = _read_zip_csv_flexible(p.read_bytes())
+        except Exception:
+            continue
+        cols = [str(c).lower() for c in df.columns]
+        df.columns = cols
+        tcol = next((c for c in cols if c in ('calc_time','fundingtime','funding_time')), None)
+        rcol = next((c for c in cols if 'funding' in c and 'time' not in c and 'interval' not in c), None)
+        if tcol is None and df.shape[1] >= 2:
+            # Legacy no-header schema: calc_time, funding_interval_hours, last_funding_rate
+            df.columns = ['calc_time'] + [f'c{i}' for i in range(1, df.shape[1]-1)] + ['last_funding_rate']
+            tcol, rcol = 'calc_time', 'last_funding_rate'
+        if tcol is None or rcol is None:
+            continue
+        idx = _to_utc_index(df[tcol])
+        rate = pd.to_numeric(df[rcol], errors='coerce').to_numpy()
+        frames.append(pd.DataFrame({'funding_rate': rate}, index=idx).dropna())
+    if not frames:
+        return pd.DataFrame(columns=['funding_rate'])
+    x = pd.concat(frames).sort_index()
+    x = x[~x.index.duplicated(keep='last')]
+    # Completed UTC day becomes known at next midnight.
+    d = x['funding_rate'].resample('1D', closed='left', label='right').agg(['mean','max','min','count'])
+    d.columns = ['funding_mean','funding_max','funding_min','funding_count']
+    return d
+
+
+def _parse_premium_kline(raw: bytes) -> pd.DataFrame:
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        name = next(n for n in z.namelist() if n.endswith('.csv'))
+        payload = z.read(name)
+    df = pd.read_csv(io.BytesIO(payload), header=None)
+    # Futures files may contain a header row; coercion below naturally drops it.
+    if df.shape[1] < 5:
+        return pd.DataFrame(columns=['premium'])
+    t = pd.to_numeric(df.iloc[:,0], errors='coerce')
+    v = pd.to_numeric(df.iloc[:,4], errors='coerce')
+    med = t.dropna().median() if t.notna().any() else 0
+    unit = 'us' if med > 1e14 else 'ms'
+    idx = pd.to_datetime(t, unit=unit, utc=True, errors='coerce')
+    return pd.DataFrame({'premium':v.to_numpy()}, index=idx).dropna().sort_index()
+
+
+def download_premium_daily(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    start_ts = max(pd.Timestamp(start, tz='UTC'), pd.Timestamp('2020-01-01', tz='UTC'))
+    end_ts = pd.Timestamp(end, tz='UTC')
+    frames=[]
+    for m in _completed_months(start_ts, end_ts):
+        ym=m.strftime('%Y-%m')
+        p=cache_dir/f'BTCUSDT-premium-1h-{ym}.zip'
+        url=f'{BINANCE_FUTURES}/monthly/premiumIndexKlines/BTCUSDT/1h/BTCUSDT-1h-{ym}.zip'
+        if not p.exists():
+            try:
+                p.write_bytes(_fetch_bytes(url))
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                raise
+        try:
+            frames.append(_parse_premium_kline(p.read_bytes()))
+        except Exception:
+            continue
+
+    # Monthly premium archives lag the current month. Fill completed current-month
+    # days from official daily premiumIndexKlines so recent OI/taker stress remains usable.
+    now=pd.Timestamp.now(tz='UTC')
+    current_month=pd.Timestamp(now.year,now.month,1,tz='UTC')
+    if end_ts >= current_month:
+        d0=max(start_ts.normalize(),current_month)
+        d1=min(end_ts.normalize(),(now-pd.Timedelta(days=1)).normalize())
+        if d1 >= d0:
+            for d0x in pd.date_range(d0,d1,freq='1D',tz='UTC'):
+                ds=d0x.strftime('%Y-%m-%d')
+                p=cache_dir/f'BTCUSDT-premium-1h-{ds}.zip'
+                url=f'{BINANCE_FUTURES}/daily/premiumIndexKlines/BTCUSDT/1h/BTCUSDT-1h-{ds}.zip'
+                if not p.exists():
+                    try:
+                        p.write_bytes(_fetch_bytes(url,retries=2))
+                    except urllib.error.HTTPError as e:
+                        if e.code == 404:
+                            continue
+                        raise
+                    except Exception:
+                        continue
+                try:
+                    frames.append(_parse_premium_kline(p.read_bytes()))
+                except Exception:
+                    continue
+    if not frames:
+        return pd.DataFrame(columns=['premium_mean','premium_max'])
+    x=pd.concat(frames).sort_index()
+    x=x[~x.index.duplicated(keep='last')]
+    d=x['premium'].resample('1D',closed='left',label='right').agg(['mean','max','min','count'])
+    d.columns=['premium_mean','premium_max','premium_min','premium_count']
+    return d
+
+
+def _parse_metrics_day(raw: bytes) -> pd.DataFrame:
+    df = _read_zip_csv_flexible(raw)
+    if df.empty:
+        return pd.DataFrame()
+    # Official metrics archives normally have headers. Handle common no-header
+    # layouts conservatively; never guess values from an unknown schema.
+    df.columns = [str(c).lower() for c in df.columns]
+    if 'create_time' not in df.columns:
+        if df.shape[1] >= 8:
+            names = [
+                'create_time','symbol','sum_open_interest','sum_open_interest_value',
+                'count_toptrader_long_short_ratio','sum_toptrader_long_short_ratio',
+                'count_long_short_ratio','sum_taker_long_short_vol_ratio'
+            ]
+            df = df.iloc[:,:8].copy(); df.columns=names
+        else:
+            return pd.DataFrame()
+    idx = _to_utc_index(df['create_time'])
+    out=pd.DataFrame(index=idx)
+    mapping = {
+        'oi_value':'sum_open_interest_value',
+        'oi_contracts':'sum_open_interest',
+        'top_ratio':'sum_toptrader_long_short_ratio',
+        'taker_ratio':'sum_taker_long_short_vol_ratio',
+    }
+    # Some archive versions name the taker field differently.
+    if 'sum_taker_long_short_vol_ratio' not in df.columns:
+        for alt in ('taker_buy_sell_ratio','sum_taker_long_short_ratio'):
+            if alt in df.columns:
+                mapping['taker_ratio']=alt; break
+    for outc, inc in mapping.items():
+        out[outc]=pd.to_numeric(df[inc],errors='coerce').to_numpy() if inc in df.columns else np.nan
+    return out.dropna(how='all').sort_index()
+
+
+def download_metrics_daily(start: str, end: str, cache_dir: Path, workers: int = 20) -> pd.DataFrame:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    d0=max(pd.Timestamp(start,tz='UTC').normalize(),pd.Timestamp('2020-09-01',tz='UTC'))
+    d1=min(pd.Timestamp(end,tz='UTC').normalize(),(pd.Timestamp.now(tz='UTC')-pd.Timedelta(days=1)).normalize())
+    if d1 < d0:
+        return pd.DataFrame(columns=['oi_value','oi_contracts','top_ratio','taker_ratio'])
+    days=list(pd.date_range(d0,d1,freq='1D',tz='UTC'))
+
+    def one(d):
+        ds=d.strftime('%Y-%m-%d')
+        p=cache_dir/f'BTCUSDT-metrics-{ds}.zip'
+        url=f'{BINANCE_FUTURES}/daily/metrics/BTCUSDT/BTCUSDT-metrics-{ds}.zip'
+        if not p.exists():
+            try:
+                p.write_bytes(_fetch_bytes(url, retries=2))
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None
+                raise
+            except Exception:
+                return None
+        try:
+            z=p.read_bytes(); x=_parse_metrics_day(z)
+            if x.empty:
+                return None
+            # Compress each 5m day immediately: end-of-day OI, mean ratios.
+            row={
+                'time':d+pd.Timedelta(days=1),
+                'oi_value':float(x['oi_value'].dropna().iloc[-1]) if 'oi_value' in x and x['oi_value'].notna().any() else np.nan,
+                'oi_contracts':float(x['oi_contracts'].dropna().iloc[-1]) if 'oi_contracts' in x and x['oi_contracts'].notna().any() else np.nan,
+                'top_ratio':float(x['top_ratio'].dropna().mean()) if 'top_ratio' in x and x['top_ratio'].notna().any() else np.nan,
+                'taker_ratio':float(x['taker_ratio'].dropna().mean()) if 'taker_ratio' in x and x['taker_ratio'].notna().any() else np.nan,
+            }
+            return row
+        except Exception:
+            return None
+
+    rows=[]
+    workers=max(1,min(int(workers),32))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(one,d) for d in days]
+        for i,f in enumerate(as_completed(futs),1):
+            r=f.result()
+            if r is not None:
+                rows.append(r)
+            if i % 250 == 0:
+                print(f'[DERIV] metrics {i}/{len(days)} files checked', flush=True)
+    if not rows:
+        return pd.DataFrame(columns=['oi_value','oi_contracts','top_ratio','taker_ratio'])
+    return pd.DataFrame(rows).set_index('time').sort_index()
+
+
+def download_derivatives_daily(start: str, end: str, cache_dir: Path, workers: int = 20) -> pd.DataFrame:
+    print('[DERIV] downloading official Binance USD-M funding/premium/OI metrics', flush=True)
+    funding=download_funding_daily(start,end,cache_dir/'funding')
+    premium=download_premium_daily(start,end,cache_dir/'premium')
+    metrics=download_metrics_daily(start,end,cache_dir/'metrics',workers=workers)
+    d=funding.join(premium,how='outer').join(metrics,how='outer').sort_index()
+    if d.empty:
+        print('[DERIV] WARNING: no derivatives data; overlay will remain neutral', flush=True)
+        return d
+    # Do not fill across long gaps or before the first observation.
+    for c in ('funding_mean','funding_max','funding_min'):
+        if c in d: d[c]=d[c].ffill(limit=1)
+    for c in ('premium_mean','premium_max','premium_min'):
+        if c in d: d[c]=d[c].ffill(limit=1)
+    for c in ('oi_value','oi_contracts','top_ratio','taker_ratio'):
+        if c in d: d[c]=d[c].ffill(limit=2)
+    print(f'[DERIV] daily rows={len(d):,} {d.index.min()} -> {d.index.max()}', flush=True)
+    return d
+
 def wilder(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
 
@@ -295,7 +593,7 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return wilder(tr, n)
 
 
-def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
+def build_features(df1h: pd.DataFrame, s: Strategy, derivatives: pd.DataFrame | None = None) -> pd.DataFrame:
     # 4H bars are labeled at bar OPEN. The bar's signal can only be acted upon
     # at a later 4H open.
     h4 = df1h[["open", "high", "low", "close", "volume"]].resample(
@@ -312,6 +610,14 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
     d = df1h[["open", "high", "low", "close", "volume"]].resample(
         "1D", closed="left", label="right"
     ).agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}).dropna()
+
+    # Derivatives daily data is already labeled at the NEXT UTC midnight, so a
+    # same-index join is anti-lookahead. Missing pre-launch data stays missing.
+    if derivatives is not None and not derivatives.empty:
+        d = d.join(derivatives, how="left")
+    for c in ["funding_mean","premium_mean","oi_value","oi_contracts","top_ratio","taker_ratio"]:
+        if c not in d.columns:
+            d[c] = np.nan
 
     # Slow return-engine regime.
     d["fast"] = d["close"].ewm(
@@ -366,6 +672,25 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
     d["high10"] = d["close"].shift(1).rolling(10, min_periods=5).max()
     d["dd10"] = d["close"] / d["high10"] - 1.0
 
+    # Orthogonal derivatives features. Z-scores use trailing windows only.
+    f7 = d["funding_mean"].rolling(7, min_periods=4).mean()
+    f_mu = f7.rolling(90, min_periods=30).mean()
+    f_sd = f7.rolling(90, min_periods=30).std().replace(0, np.nan)
+    d["funding_z"] = (f7 - f_mu) / f_sd
+    p3 = d["premium_mean"].rolling(3, min_periods=2).mean()
+    p_mu = p3.rolling(90, min_periods=30).mean()
+    p_sd = p3.rolling(90, min_periods=30).std().replace(0, np.nan)
+    d["premium_z"] = (p3 - p_mu) / p_sd
+    # Use BTC-contract OI rather than USD OI value to avoid mechanically
+    # re-importing spot price changes into the supposedly orthogonal feature.
+    d["oi_chg1"] = d["oi_contracts"].pct_change(1, fill_method=None)
+    d["oi_chg7"] = d["oi_contracts"].pct_change(7, fill_method=None)
+    d["taker7"] = d["taker_ratio"].rolling(7, min_periods=4).mean()
+    d["top7"] = d["top_ratio"].rolling(7, min_periods=4).mean()
+    d["deriv_available"] = (
+        d["premium_z"].notna() & d["oi_chg7"].notna() & d["taker7"].notna()
+    )
+
     d["atr_pct"] = atr(d, 14) / d["close"]
     d["shock_cut"] = d["atr_pct"].rolling(540, min_periods=180).quantile(0.95)
     d["shock"] = (
@@ -379,7 +704,8 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
     right = d[[
         "regime", "rv30", "rv_ratio", "shock", "fast", "slow", "slow_slope",
         "risk_fast", "risk_mid", "risk_slow", "ret3", "ret5", "ret20", "dd10", "dd20",
-        "down_sv10", "down_sv30", "down_sv_ratio", "dclose", "daily_seq"
+        "down_sv10", "down_sv30", "down_sv_ratio", "dclose", "daily_seq",
+        "funding_z", "premium_z", "oi_chg1", "oi_chg7", "taker7", "top7", "deriv_available"
     ]].reset_index()
     right = right.rename(columns={right.columns[0]:"time"})
     x = pd.merge_asof(
@@ -537,22 +863,90 @@ def market_scale_for_state(state: str, s: Strategy) -> float:
     return 1.0
 
 
+
+DERIV_LEVEL = {"NORMAL":0, "WARN":1, "HIGH":2, "PANIC":3}
+DERIV_STATE = {v:k for k,v in DERIV_LEVEL.items()}
+
+
+def raw_derivative_state(funding_z: float, premium_z: float, oi_chg1: float,
+                         oi_chg7: float, taker7: float, ret3: float, ret5: float,
+                         available: bool, s: Strategy):
+    """Positioning stress from completed derivatives data only."""
+    if not available:
+        return "NORMAL", 0
+    crowd_warn = (
+        np.isfinite(funding_z) and funding_z >= s.deriv_funding_z_warn and
+        np.isfinite(premium_z) and premium_z >= s.deriv_premium_z_warn
+    )
+    crowd_high = (
+        np.isfinite(funding_z) and funding_z >= s.deriv_funding_z_high and
+        np.isfinite(premium_z) and premium_z >= s.deriv_premium_z_high
+    )
+    oi_build_warn = np.isfinite(oi_chg7) and oi_chg7 >= s.deriv_oi7_warn
+    oi_build_high = np.isfinite(oi_chg7) and oi_chg7 >= s.deriv_oi7_high
+    sell_warn = np.isfinite(taker7) and taker7 <= s.deriv_taker_warn
+    sell_high = np.isfinite(taker7) and taker7 <= s.deriv_taker_high
+    delever = (
+        np.isfinite(oi_chg1) and oi_chg1 <= s.deriv_oi1_drop_high and
+        np.isfinite(ret3) and ret3 < -0.02
+    )
+    warnings = int(crowd_warn) + int(oi_build_warn) + int(sell_warn)
+    panic = (
+        (delever and sell_high) or
+        (crowd_high and sell_high and np.isfinite(ret3) and ret3 < -0.035) or
+        (oi_build_high and crowd_high and np.isfinite(ret5) and ret5 < -0.05)
+    )
+    if panic:
+        return "PANIC", warnings
+    high = (
+        (crowd_high and (oi_build_warn or sell_warn)) or
+        (oi_build_high and (crowd_warn or sell_warn)) or
+        delever or
+        warnings >= 3
+    )
+    if high:
+        return "HIGH", warnings
+    if warnings >= 1:
+        return "WARN", warnings
+    return "NORMAL", warnings
+
+
+def derivative_hysteresis_update(current: str | None, raw: str, recovery_count: int,
+                                  recovery_days: int):
+    if current is None:
+        return raw, 0
+    c=DERIV_LEVEL[current]; r=DERIV_LEVEL[raw]
+    if r >= c:
+        return raw, 0
+    recovery_count += 1
+    if recovery_count < recovery_days:
+        return current, recovery_count
+    return DERIV_STATE[max(r, c-1)], 0
+
+
+def derivative_scale_for_state(state: str, s: Strategy) -> float:
+    if state == "WARN": return s.deriv_scale_warn
+    if state == "HIGH": return s.deriv_scale_high
+    if state == "PANIC": return s.deriv_scale_panic
+    return 1.0
+
 def target_exposure(regime: str, rv: float, tactical_side: int, s: Strategy,
-                    market_state: str, downside_state: str,
+                    market_state: str, downside_state: str, derivative_state: str,
                     market_risk_enabled: bool = True,
-                    downside_filter_enabled: bool = True):
+                    downside_filter_enabled: bool = False,
+                    derivative_filter_enabled: bool = True):
     vscale = vol_scale(rv, s)
     core = core_exposure(regime, s) * vscale
     tactical = 0.0
+    deriv_ok = (not derivative_filter_enabled or derivative_state in ("NORMAL","WARN"))
     if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
-        if (market_state in ("NORMAL", "CAUTION") and
-                (not downside_filter_enabled or downside_state != "HIGH")):
+        if (market_state in ("NORMAL", "CAUTION") and deriv_ok):
             tactical = s.tactical_long * vscale
     mscale = market_scale_for_state(market_state, s) if market_risk_enabled else 1.0
     dscale = downside_scale_for_state(downside_state, s) if downside_filter_enabled else 1.0
-    exp = (core + tactical) * mscale * dscale
-    return float(np.clip(exp, 0.0, s.max_long)), mscale, dscale
-
+    xscale = derivative_scale_for_state(derivative_state, s) if derivative_filter_enabled else 1.0
+    exp = (core + tactical) * mscale * dscale * xscale
+    return float(np.clip(exp, 0.0, s.max_long)), mscale, dscale, xscale
 
 def trade_cost(delta_notional: float, costs: CostModel) -> float:
     # Fee plus an explicit slippage penalty. Both are charged on every rebalance.
@@ -563,9 +957,11 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
              initial: float = 10_000.0, signal_delay_bars: int = 1,
              tactical_enabled: bool = True, enforce_hard_stop: bool = True,
              market_risk_enabled: bool = True, hysteresis_enabled: bool = True,
-             downside_filter_enabled: bool = True,
+             downside_filter_enabled: bool = False,
+             derivative_filter_enabled: bool = True,
+             derivatives: pd.DataFrame | None = None,
              trade_start: pd.Timestamp | None = None):
-    x = build_features(df1h, s).dropna(
+    x = build_features(df1h, s, derivatives=derivatives).dropna(
         subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid",
                 "risk_slow", "ret20", "dd20", "down_sv10", "down_sv30",
                 "down_sv_ratio", "ret3", "dd10"]
@@ -617,6 +1013,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_regime = None
     last_risk_state = None
     last_downside_state = None
+    last_derivative_state = None
 
     # Hysteresis updates only when a NEW completed daily bar becomes available.
     effective_risk_state = None
@@ -627,6 +1024,10 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     effective_downside_state = None
     downside_recovery_count = 0
     last_raw_downside_state = "NORMAL"
+    effective_derivative_state = None
+    derivative_recovery_count = 0
+    last_raw_derivative_state = "NORMAL"
+    last_derivative_warning_count = 0
 
     def set_position(ts, px, desired_exp, reason):
         nonlocal equity, qty, total_costs, rebalance_count, last_exposure
@@ -665,6 +1066,13 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         down_sv30 = float(r.down_sv30) if np.isfinite(r.down_sv30) else 0.0
         down_sv_ratio = float(r.down_sv_ratio) if np.isfinite(r.down_sv_ratio) else 1.0
         daily_seq = int(r.daily_seq)
+        funding_z = float(r.funding_z) if np.isfinite(r.funding_z) else np.nan
+        premium_z = float(r.premium_z) if np.isfinite(r.premium_z) else np.nan
+        oi_chg1 = float(r.oi_chg1) if np.isfinite(r.oi_chg1) else np.nan
+        oi_chg7 = float(r.oi_chg7) if np.isfinite(r.oi_chg7) else np.nan
+        taker7 = float(r.taker7) if np.isfinite(r.taker7) else np.nan
+        top7 = float(r.top7) if np.isfinite(r.top7) else np.nan
+        deriv_available = bool(r.deriv_available) if pd.notna(r.deriv_available) else False
 
         if prev_close is not None:
             equity += qty * (o - prev_close)
@@ -704,11 +1112,28 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             else:
                 effective_downside_state = raw_down
                 downside_recovery_count = 0
+
+            raw_deriv, deriv_warns = raw_derivative_state(
+                funding_z, premium_z, oi_chg1, oi_chg7, taker7, ret3, ret5,
+                deriv_available, s
+            )
+            last_raw_derivative_state = raw_deriv
+            last_derivative_warning_count = deriv_warns
+            if hysteresis_enabled:
+                effective_derivative_state, derivative_recovery_count = derivative_hysteresis_update(
+                    effective_derivative_state, raw_deriv, derivative_recovery_count,
+                    s.deriv_recovery_days
+                )
+            else:
+                effective_derivative_state = raw_deriv
+                derivative_recovery_count = 0
             last_daily_seq = daily_seq
 
         risk_state = effective_risk_state or last_raw_state
         downside_state = effective_downside_state or last_raw_downside_state
+        derivative_state = effective_derivative_state or last_raw_derivative_state
         warning_count = last_warning_count
+        derivative_warning_count = last_derivative_warning_count
 
         if pending_tactical is not None:
             action, pside, remaining = pending_tactical
@@ -718,6 +1143,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                     if (regime in ("BULL_STRONG", "BULL_WEAK") and
                             risk_state in ("NORMAL", "CAUTION") and
                             (not downside_filter_enabled or downside_state != "HIGH") and
+                            (not derivative_filter_enabled or derivative_state in ("NORMAL","WARN")) and
                             not hard_stopped):
                         tactical_side = pside
                         tactical_peak = o
@@ -732,24 +1158,28 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         reason = "MODEL"
         mscale = 0.0
         dscale = 0.0
+        xscale = 0.0
         if hard_stopped or day_lock or week_lock:
             reason = "LOCK"
         else:
-            desired, mscale, dscale = target_exposure(
+            desired, mscale, dscale, xscale = target_exposure(
                 regime, rv, tactical_side if tactical_enabled else 0, s,
-                risk_state, downside_state,
+                risk_state, downside_state, derivative_state,
                 market_risk_enabled=market_risk_enabled,
                 downside_filter_enabled=downside_filter_enabled,
+                derivative_filter_enabled=derivative_filter_enabled,
             )
 
         if (abs(desired - last_exposure) >= 0.025 or
                 regime != last_regime or risk_state != last_risk_state or
                 downside_state != last_downside_state or
+                derivative_state != last_derivative_state or
                 (desired == 0 and abs(last_exposure) > 1e-12)):
             set_position(ts, o, desired, reason)
         last_regime = regime
         last_risk_state = risk_state
         last_downside_state = downside_state
+        last_derivative_state = derivative_state
 
         if abs(qty) > 0:
             bars_exposed += 1
@@ -776,13 +1206,15 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         if tactical_enabled and not hard_stopped:
             buf = s.breakout_buffer_atr * a
             if (risk_state in ("DEFENSIVE", "PANIC") or
-                    (downside_filter_enabled and downside_state == "HIGH")) and tactical_side > 0:
+                    (downside_filter_enabled and downside_state == "HIGH") or
+                    (derivative_filter_enabled and derivative_state in ("HIGH","PANIC"))) and tactical_side > 0:
                 if pending_tactical is None:
                     pending_tactical = ("EXIT", +1, max(1, signal_delay_bars))
             elif tactical_side == 0 and pending_tactical is None:
                 if (regime in ("BULL_STRONG", "BULL_WEAK") and
                         risk_state in ("NORMAL", "CAUTION") and
                         (not downside_filter_enabled or downside_state != "HIGH") and
+                        (not derivative_filter_enabled or derivative_state in ("NORMAL","WARN")) and
                         c > float(r.entry_hi) + buf):
                     pending_tactical = ("ENTER", +1, max(1, signal_delay_bars))
             elif tactical_side > 0:
@@ -801,6 +1233,15 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             "raw_downside_state":last_raw_downside_state,
             "downside_state":downside_state, "downside_scale":dscale,
             "downside_recovery_count":downside_recovery_count,
+            "raw_derivative_state":last_raw_derivative_state,
+            "derivative_state":derivative_state,
+            "derivative_warning_count":derivative_warning_count,
+            "derivative_scale":xscale,
+            "derivative_recovery_count":derivative_recovery_count,
+            "funding_z":funding_z, "premium_z":premium_z,
+            "oi_chg1":oi_chg1, "oi_chg7":oi_chg7,
+            "taker7":taker7, "top7":top7,
+            "deriv_available":deriv_available,
             "recovery_count":recovery_count, "drawdown":dd,
             "tactical_side":tactical_side, "day_lock":day_lock, "week_lock":week_lock,
         })
@@ -877,7 +1318,31 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
         "hard_breached":bool(extra.get("hard_breached", extra["hard_stopped"])),
         "hard_breach_count":int(extra.get("hard_breach_count", int(extra["hard_stopped"]))),
         "first_hard_breach_time":extra.get("first_hard_breach_time"),
+        "derivatives_available_fraction":(
+            float(eq["deriv_available"].astype(float).mean())
+            if "deriv_available" in eq.columns else np.nan
+        ),
+        "derivatives_high_panic_fraction":(
+            float(eq["derivative_state"].isin(["HIGH","PANIC"]).mean())
+            if "derivative_state" in eq.columns else np.nan
+        ),
     }
+
+
+def equity_period_metrics(eq: pd.DataFrame, start: str):
+    if eq.empty:
+        return {}
+    t0=pd.Timestamp(start,tz="UTC")
+    g=eq.loc[eq.index>=t0].copy()
+    if len(g)<50:
+        return {}
+    init=float(g.equity.iloc[0])
+    extra={
+        "rebalances":0,"costs":0.0,"hard_stopped":False,"hard_breached":False,
+        "hard_breach_count":0,"first_hard_breach_time":None,
+        "bars_exposed":int((g.target_exposure.abs()>1e-9).sum()),"bars_total":len(g),
+    }
+    return metrics(g,pd.DataFrame(),extra,init)
 
 
 def objective(m):
@@ -902,21 +1367,28 @@ def objective(m):
     )
 
 
-def run_candidates(data, costs, rules, initial, delay=1):
+def run_candidates(data, costs, rules, initial, derivatives=None, delay=1):
     rows=[]; outputs={}
     for s in CANDIDATES:
         print(f"[TEST] {s.name}", flush=True)
         seq,str_,sev,sex = backtest(
-            data,s,costs,rules,initial,delay,enforce_hard_stop=False
+            data,s,costs,rules,initial,delay,enforce_hard_stop=False, derivatives=derivatives
         )
         sm = metrics(seq,str_,sex,initial)
+        era = equity_period_metrics(seq,"2021-01-01")
         req,rtr,rev,rex = backtest(
-            data,s,costs,rules,initial,delay,enforce_hard_stop=True
+            data,s,costs,rules,initial,delay,enforce_hard_stop=True, derivatives=derivatives
         )
         rm = metrics(req,rtr,rex,initial)
         row = {
             "strategy":s.name,
             **{f"shadow_{k}":v for k,v in sm.items()},
+            "deriv_era_cagr":era.get("cagr",np.nan),
+            "deriv_era_mdd":era.get("max_drawdown",np.nan),
+            "deriv_era_sharpe":era.get("sharpe_365",np.nan),
+            "deriv_era_pf":era.get("profit_factor_daily",np.nan),
+            "deriv_era_mdd_gate":bool(era and abs(era.get("max_drawdown",-9))<=rules.hard_drawdown),
+            "deriv_era_score":objective(era) if era else -1e9,
             "risk_final_usd":rm["final_usd"],
             "risk_total_return":rm["total_return"],
             "risk_cagr":rm["cagr"],
@@ -932,10 +1404,13 @@ def run_candidates(data, costs, rules, initial, delay=1):
             "shadow":(seq,str_,sev,sm),
             "risk":(req,rtr,rev,rm),
         }
-    return pd.DataFrame(rows).sort_values(["mdd_gate","score"],ascending=[False,False]), outputs
+    return pd.DataFrame(rows).sort_values(
+        ["deriv_era_mdd_gate","deriv_era_score","mdd_gate","score"],
+        ascending=[False,False,False,False]
+    ), outputs
 
 
-def walk_forward(data, costs, rules, initial):
+def walk_forward(data, costs, rules, initial, derivatives=None):
     start=data.index.min().normalize(); end=data.index.max().normalize()
     rows=[]; anchor=start
     while anchor + pd.DateOffset(years=4) <= end + pd.Timedelta(days=1):
@@ -954,7 +1429,7 @@ def walk_forward(data, costs, rules, initial):
 
         scored=[]
         for s in CANDIDATES:
-            eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False)
+            eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False,derivatives=derivatives)
             m=metrics(eq,tr,ex,initial)
             scored.append((abs(m["max_drawdown"]) <= rules.hard_drawdown, objective(m), s, m))
         scored.sort(key=lambda z:(z[0], z[1]), reverse=True)
@@ -962,12 +1437,12 @@ def walk_forward(data, costs, rules, initial):
 
         seq,str_,sev,sex=backtest(
             test_warm, chosen, costs, rules, initial,
-            enforce_hard_stop=False, trade_start=test_start
+            enforce_hard_stop=False, trade_start=test_start, derivatives=derivatives
         )
         sm=metrics(seq,str_,sex,initial)
         req,rtr,rev,rex=backtest(
             test_warm, chosen, costs, rules, initial,
-            enforce_hard_stop=True, trade_start=test_start
+            enforce_hard_stop=True, trade_start=test_start, derivatives=derivatives
         )
         rm=metrics(req,rtr,rex,initial)
 
@@ -993,45 +1468,46 @@ def walk_forward(data, costs, rules, initial):
     return pd.DataFrame(rows)
 
 
-def robustness_grid(data, best: Strategy, costs, rules, initial):
+def robustness_grid(data, best: Strategy, costs, rules, initial, derivatives=None):
     rows=[]
-    # Orthogonal robustness: downside thresholds ±20% plus exposure ±20%.
-    # threshold_mult > 1 is looser because absolute/ratio triggers are higher;
-    # drawdown/momentum negative cuts are also scaled away from zero.
+    # Orthogonal robustness: derivative thresholds ±20% plus exposure ±20%.
     for threshold_mult in (0.8,1.0,1.2):
         for exp_mult in (0.8,1.0,1.2):
+            # z/positive build thresholds scale normally. Negative OI-drop threshold
+            # scales away from zero for >1 (looser), toward zero for <1 (tighter).
             s=replace(
                 best,
-                name=f"{best.name}_D{threshold_mult:.1f}_E{exp_mult:.1f}",
-                down_sv_warn=best.down_sv_warn*threshold_mult,
-                down_sv_high=best.down_sv_high*threshold_mult,
-                down_ratio_warn=best.down_ratio_warn*threshold_mult,
-                down_ratio_high=best.down_ratio_high*threshold_mult,
-                down_dd10_warn=best.down_dd10_warn*threshold_mult,
-                down_dd10_high=best.down_dd10_high*threshold_mult,
-                down_ret3_high=best.down_ret3_high*threshold_mult,
-                strong_long=min(1.15, best.strong_long*exp_mult),
-                weak_long=min(0.70, best.weak_long*exp_mult),
-                tactical_long=min(0.40, best.tactical_long*exp_mult),
-                max_long=min(1.25, best.max_long*exp_mult),
+                name=f"{best.name}_X{threshold_mult:.1f}_E{exp_mult:.1f}",
+                deriv_funding_z_warn=best.deriv_funding_z_warn*threshold_mult,
+                deriv_funding_z_high=best.deriv_funding_z_high*threshold_mult,
+                deriv_premium_z_warn=best.deriv_premium_z_warn*threshold_mult,
+                deriv_premium_z_high=best.deriv_premium_z_high*threshold_mult,
+                deriv_oi7_warn=best.deriv_oi7_warn*threshold_mult,
+                deriv_oi7_high=best.deriv_oi7_high*threshold_mult,
+                deriv_oi1_drop_high=best.deriv_oi1_drop_high*threshold_mult,
+                # For taker ratios below 1, convert distance from 1.0.
+                deriv_taker_warn=1-(1-best.deriv_taker_warn)*threshold_mult,
+                deriv_taker_high=1-(1-best.deriv_taker_high)*threshold_mult,
+                strong_long=min(1.15,best.strong_long*exp_mult),
+                weak_long=min(0.70,best.weak_long*exp_mult),
+                tactical_long=min(0.40,best.tactical_long*exp_mult),
+                max_long=min(1.25,best.max_long*exp_mult),
             )
-            seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False)
+            seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False,derivatives=derivatives)
             sm=metrics(seq,str_,sex,initial)
-            req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
+            req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True,derivatives=derivatives)
             rm=metrics(req,rtr,rex,initial)
             rows.append({
-                "downside_threshold_mult":threshold_mult,"exposure_mult":exp_mult,
-                "down_sv_warn":s.down_sv_warn,"down_ratio_warn":s.down_ratio_warn,
-                "max_long":s.max_long,
+                "derivative_threshold_mult":threshold_mult,"exposure_mult":exp_mult,
+                "funding_z_warn":s.deriv_funding_z_warn,"premium_z_warn":s.deriv_premium_z_warn,
+                "oi7_warn":s.deriv_oi7_warn,"max_long":s.max_long,
                 "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
-                "shadow_sharpe":sm["sharpe_365"],
-                "shadow_pf_daily":sm["profit_factor_daily"],
+                "shadow_sharpe":sm["sharpe_365"],"shadow_pf_daily":sm["profit_factor_daily"],
                 "shadow_hard_breached":sm["hard_breached"],
                 "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
                 "risk_hard_stopped":rm["hard_stopped"],
             })
     return pd.DataFrame(rows)
-
 
 def yearly(eq):
     rows=[]
@@ -1148,21 +1624,29 @@ def main():
     ap.add_argument("--fee-bps",type=float,default=5.5)
     ap.add_argument("--slippage-bps",type=float,default=2.0)
     ap.add_argument("--cache",default="data_cache")
+    ap.add_argument("--deriv-workers",type=int,default=20)
+    ap.add_argument("--no-derivatives",action="store_true")
     ap.add_argument("--results",default="results")
     args=ap.parse_args()
 
     out=Path(args.results); out.mkdir(parents=True,exist_ok=True)
-    data=download_btc_1h(args.start,args.end,Path(args.cache))
+    cache_root=Path(args.cache)
+    data=download_btc_1h(args.start,args.end,cache_root/"spot")
+    derivatives=(pd.DataFrame() if args.no_derivatives else
+                 download_derivatives_daily(args.start,args.end,cache_root/"derivatives",workers=args.deriv_workers))
+    if not derivatives.empty:
+        derivatives.to_csv(out/"derivatives_daily.csv")
     costs=CostModel(args.fee_bps,args.slippage_bps)
     rules=RiskRules()
 
-    cand,outputs=run_candidates(data,costs,rules,args.initial)
+    cand,outputs=run_candidates(data,costs,rules,args.initial,derivatives=derivatives)
     cand.to_csv(out/"candidate_summary.csv",index=False)
     best_name=str(cand.iloc[0].strategy)
     best_s=next(s for s in CANDIDATES if s.name==best_name)
 
     seq,str_,sev,bsm=outputs[best_name]["shadow"]
     req,rtr,rev,brm=outputs[best_name]["risk"]
+    best_era=equity_period_metrics(seq,"2021-01-01")
 
     seq.to_csv(out/"equity_shadow.csv")
     req.to_csv(out/"equity_risk_gated.csv")
@@ -1187,16 +1671,24 @@ def main():
         ).reset_index()
         ds["fraction"] = ds["bars"] / max(len(seq), 1)
         ds.to_csv(out/"downside_state_distribution.csv", index=False)
+    if "derivative_state" in seq.columns:
+        xs = seq.groupby("derivative_state").agg(
+            bars=("equity","size"),
+            avg_exposure=("target_exposure","mean"),
+            avg_abs_exposure=("target_exposure",lambda z: z.abs().mean()),
+        ).reset_index()
+        xs["fraction"] = xs["bars"] / max(len(seq),1)
+        xs.to_csv(out/"derivative_state_distribution.csv",index=False)
 
-    wf=walk_forward(data,costs,rules,args.initial)
+    wf=walk_forward(data,costs,rules,args.initial,derivatives=derivatives)
     wf.to_csv(out/"walk_forward.csv",index=False)
 
     stress_costs=CostModel(args.fee_bps*2,args.slippage_bps*2)
     stress_rows=[]; stress_shadow_map={}; stress_risk_map={}
     for s in CANDIDATES:
-        se,st,sv,sx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=False)
+        se,st,sv,sx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=False,derivatives=derivatives)
         sm=metrics(se,st,sx,args.initial)
-        re,rt,rv,rx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=True)
+        re,rt,rv,rx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=True,derivatives=derivatives)
         rm=metrics(re,rt,rx,args.initial)
         stress_shadow_map[s.name]=sm; stress_risk_map[s.name]=rm
         stress_rows.append({
@@ -1211,9 +1703,9 @@ def main():
 
     delay_rows=[]; delay_shadow_map={}; delay_risk_map={}
     for s in CANDIDATES:
-        se,st,sv,sx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=False)
+        se,st,sv,sx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=False,derivatives=derivatives)
         sm=metrics(se,st,sx,args.initial)
-        re,rt,rv,rx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=True)
+        re,rt,rv,rx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=True,derivatives=derivatives)
         rm=metrics(re,rt,rx,args.initial)
         delay_shadow_map[s.name]=sm; delay_risk_map[s.name]=rm
         delay_rows.append({
@@ -1227,33 +1719,33 @@ def main():
 
     ce,ct,cv,cx=backtest(
         data,best_s,costs,rules,args.initial,
-        tactical_enabled=False,enforce_hard_stop=False
+        tactical_enabled=False,enforce_hard_stop=False,derivatives=derivatives
     )
     core_m=metrics(ce,ct,cx,args.initial)
     be,bt,bv,bx=backtest(
         data,best_s,costs,rules,args.initial,
-        enforce_hard_stop=False, market_risk_enabled=False
+        enforce_hard_stop=False, market_risk_enabled=False,derivatives=derivatives
     )
     base_engine_m=metrics(be,bt,bx,args.initial)
     re0,rt0,rv0,rx0=backtest(
         data,best_s,costs,rules,args.initial,
-        enforce_hard_stop=False, hysteresis_enabled=False
+        enforce_hard_stop=False, hysteresis_enabled=False,derivatives=derivatives
     )
     raw_overlay_m=metrics(re0,rt0,rx0,args.initial)
     nd_eq,nd_tr,nd_ev,nd_ex=backtest(
         data,best_s,costs,rules,args.initial,
-        enforce_hard_stop=False, downside_filter_enabled=False
+        enforce_hard_stop=False, derivative_filter_enabled=False, derivatives=derivatives
     )
-    no_downside_m=metrics(nd_eq,nd_tr,nd_ex,args.initial)
+    no_derivative_m=metrics(nd_eq,nd_tr,nd_ex,args.initial)
     pd.DataFrame([
-        {"variant":"selected V7.3 market risk + downside filter",**bsm},
-        {"variant":"same V7.1D engine, downside filter disabled",**no_downside_m},
+        {"variant":"selected V8 market risk + derivatives filter",**bsm},
+        {"variant":"same V7.1D engine, derivatives filter disabled",**no_derivative_m},
         {"variant":"core only",**core_m},
         {"variant":"base return engine (market overlay disabled)",**base_engine_m},
         {"variant":"raw overlays (hysteresis disabled)",**raw_overlay_m},
     ]).to_csv(out/"attribution.csv",index=False)
 
-    robust=robustness_grid(data,best_s,costs,rules,args.initial)
+    robust=robustness_grid(data,best_s,costs,rules,args.initial,derivatives=derivatives)
     robust.to_csv(out/"robustness_grid.csv",index=False)
 
     bh=benchmark_buyhold(data,args.initial)
@@ -1282,17 +1774,18 @@ def main():
     )
 
     summary={
-        "version":"V7.3 Downside Risk Filter",
+        "version":"V8.0 Derivatives Risk Filter",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),
         "selected_candidate":best_name,
-        "selection_method":"V7.1D engine fixed; MDD<=15% downside-filter candidates first, then continuous risk-adjusted score",
+        "selection_method":"V7.1D engine fixed; derivatives-filter candidates ranked risk-first with continuous score",
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
+        "selected_derivatives_era_metrics_2021plus":best_era,
         "core_only_shadow_metrics":core_m,
         "base_engine_shadow_metrics":base_engine_m,
         "raw_overlay_shadow_metrics":raw_overlay_m,
-        "no_downside_filter_shadow_metrics":no_downside_m,
+        "no_derivatives_filter_shadow_metrics":no_derivative_m,
         "development_target":{
             "shadow_cagr_ge_20pct":bool(bsm["cagr"] >= 0.20),
             "shadow_mdd_le_15pct":bool(abs(bsm["max_drawdown"]) <= 0.15),
@@ -1303,35 +1796,41 @@ def main():
         "acceptance":gates,
         "overall_pass":bool(primary_pass),
         "research_note":(
-            "V7.3 was designed after observing V1-V7.2 results. Its walk-forward "
+            "V8.0 was designed after observing V1-V7.3 results. Its walk-forward "
             "windows are useful robustness checks but are NOT pristine untouched "
             "out-of-sample evidence for the overall research program."
         ),
         "assumptions":{
             "price_source":"Binance BTCUSDT spot 1H price proxy",
+            "derivatives_source":"Binance USD-M public fundingRate + premiumIndexKlines + daily metrics",
+            "derivatives_coverage_rows":int(len(derivatives)),
+            "liquidation_feature":"not used; official USD-M liquidationSnapshot history is incomplete",
+            "etf_flow_feature":"not used in V8.0; history starts 2024",
             "fee_bps_per_rebalance":costs.fee_bps,
             "slippage_bps_per_rebalance":costs.slippage_bps,
-            "funding_included":False,
+            "funding_included":bool(not derivatives.empty),
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "hard_stop_policy":"V7.1 market-state scaling plus downside-only scaling and a separate 15% terminal stop in risk-gated run; no progressive account-DD sizing in shadow run",
+            "hard_stop_policy":"V7.1 market-state scaling plus derivatives-risk scaling and separate 15% terminal stop in risk-gated run; no progressive account-DD sizing in shadow run",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V7.3 — Downside-Risk Filter","",
+        "# BTC AI EA V8.0 — Derivatives-Risk Filter","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
         f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
         f"- Shadow Sharpe / PF: **{bsm['sharpe_365']:.2f} / {bsm['profit_factor_daily']:.2f}**",
+        f"- 2021+ derivatives-era CAGR / MDD: **{pct(best_era.get('cagr'))} / {pct(best_era.get('max_drawdown'))}**",
+        f"- Derivatives feature coverage fraction: **{pct(bsm.get('derivatives_available_fraction'))}**",
         f"- Shadow hard-DD breached: **{bsm['hard_breached']}** ({bsm['hard_breach_count']} crossings)",
         f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
         f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
         f"- Core-only shadow CAGR: **{pct(core_m['cagr'])}**",
         f"- Base-engine CAGR (no market overlay): **{pct(base_engine_m['cagr'])}**",
         f"- Raw-overlay CAGR (no hysteresis): **{pct(raw_overlay_m['cagr'])}**",
-        f"- Same engine without downside filter CAGR / MDD: **{pct(no_downside_m['cagr'])} / {pct(no_downside_m['max_drawdown'])}**",
+        f"- Same engine without derivatives filter CAGR / MDD: **{pct(no_derivative_m['cagr'])} / {pct(no_derivative_m['max_drawdown'])}**",
         f"- Development target (CAGR>=20%, MDD<=15%): **{'PASS' if summary['development_target']['both'] else 'FAIL'}**",
         f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
         f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
@@ -1353,11 +1852,11 @@ def main():
         summary["research_note"],
         "",
         "## Decision rule","",
-        "Do not deploy live unless V7.3 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
+        "Do not deploy live unless V8 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V7.3 COMPLETE ===")
+    print("\n=== V8.0 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
