@@ -1,0 +1,37 @@
+name: BTC AI EA Backtest
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "backtest.py"
+      - "requirements.txt"
+      - ".github/workflows/backtest.yml"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run BTC full-history backtest
+        run: python backtest.py --start 2017-08-17 --initial 10000
+
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-ai-ea-backtest-results
+          path: results/
+          if-no-files-found: error
