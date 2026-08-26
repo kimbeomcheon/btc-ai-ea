@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V5 Core + Tactical Trend Backtester
+BTC AI EA — V5.1 Core + Tactical Evaluation Backtester
 ================================================
 
-Why V5 exists
+Why V5.1 exists
 -------------
 V4 reduced turnover and drawdown, but captured too little of BTC's secular upside.
-V5 deliberately separates the portfolio into:
+V5.1 keeps the V5 architecture but fixes the evaluation engine and focuses on the V5C family:
 
   1) CORE: slow daily trend exposure designed to stay invested through major bull legs.
   2) TACTICAL: smaller 4H breakout sleeve that adds only when trend accelerates.
@@ -75,29 +75,38 @@ class Strategy:
 
 
 CANDIDATES = [
+    # V5C baseline from the previous run. Kept as a fixed reference.
     Strategy(
-        "V5A", fast_days=100, slow_days=200, slope_days=20,
-        strong_long=0.85, weak_long=0.55, strong_short=-0.15,
-        tactical_long=0.30, tactical_short=-0.10,
-        breakout_4h=30, exit_4h=15, trail_atr_4h=4.0,
-        breakout_buffer_atr=0.05, vol_target=0.65, vol_floor_scale=0.65,
-        max_long=1.20, max_short=0.25, shock_scale=0.50,
-    ),
-    Strategy(
-        "V5B", fast_days=50, slow_days=200, slope_days=20,
-        strong_long=1.00, weak_long=0.65, strong_short=-0.10,
-        tactical_long=0.25, tactical_short=-0.08,
-        breakout_4h=55, exit_4h=20, trail_atr_4h=5.0,
-        breakout_buffer_atr=0.05, vol_target=0.70, vol_floor_scale=0.70,
-        max_long=1.25, max_short=0.20, shock_scale=0.55,
-    ),
-    Strategy(
-        "V5C", fast_days=100, slow_days=250, slope_days=30,
+        "V5.1C100", fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.80, weak_long=0.40, strong_short=-0.20,
         tactical_long=0.30, tactical_short=-0.10,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=1.10, max_short=0.30, shock_scale=0.45,
+    ),
+    Strategy(
+        "V5.1C90", fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, strong_short=-0.18,
+        tactical_long=0.27, tactical_short=-0.09,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.99, max_short=0.27, shock_scale=0.45,
+    ),
+    Strategy(
+        "V5.1C80", fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.64, weak_long=0.32, strong_short=-0.16,
+        tactical_long=0.24, tactical_short=-0.08,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.88, max_short=0.24, shock_scale=0.45,
+    ),
+    Strategy(
+        "V5.1C90L", fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, strong_short=0.0,
+        tactical_long=0.27, tactical_short=0.0,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.99, max_short=0.0, shock_scale=0.45,
     ),
 ]
 
@@ -117,7 +126,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v5/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v5.1/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -323,7 +332,8 @@ def trade_cost(delta_notional: float, costs: CostModel) -> float:
 
 def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules,
              initial: float = 10_000.0, signal_delay_bars: int = 1,
-             tactical_enabled: bool = True, shorts_enabled: bool = True):
+             tactical_enabled: bool = True, shorts_enabled: bool = True,
+             enforce_hard_stop: bool = True):
     x = build_features(df1h, s).dropna(subset=["rv30", "atr4h", "regime"])
     if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
@@ -339,6 +349,10 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     day_lock = False
     week_lock = False
     hard_stopped = False
+    hard_breached = False
+    hard_breach_count = 0
+    first_hard_breach_time = None
+    was_below_hard = False
 
     tactical_side = 0
     tactical_peak = np.nan
@@ -450,8 +464,15 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             day_lock = True
         if week_start > 0 and equity / week_start - 1 <= -rules.weekly_loss_lock:
             week_lock = True
-        if dd <= -rules.hard_drawdown:
-            hard_stopped = True
+        below_hard = dd <= -rules.hard_drawdown
+        if below_hard and not was_below_hard:
+            hard_breached = True
+            hard_breach_count += 1
+            if first_hard_breach_time is None:
+                first_hard_breach_time = ts
+            if enforce_hard_stop:
+                hard_stopped = True
+        was_below_hard = below_hard
 
         # Generate tactical transition for a FUTURE 4H open.
         if tactical_enabled and not hard_stopped:
@@ -516,6 +537,9 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     evdf = pd.DataFrame(events)
     extra = {
         "costs":total_costs, "hard_stopped":hard_stopped,
+        "hard_breached":hard_breached,
+        "hard_breach_count":hard_breach_count,
+        "first_hard_breach_time":str(first_hard_breach_time) if first_hard_breach_time is not None else None,
         "bars_exposed":bars_exposed, "bars_total":len(eqdf),
         "rebalances":rebalance_count,
     }
@@ -554,32 +578,67 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
         "costs_paid_usd":float(extra["costs"]),
         "market_exposure":extra["bars_exposed"]/max(extra["bars_total"],1),
         "hard_stopped":bool(extra["hard_stopped"]),
+        "hard_breached":bool(extra.get("hard_breached", extra["hard_stopped"])),
+        "hard_breach_count":int(extra.get("hard_breach_count", int(extra["hard_stopped"]))),
+        "first_hard_breach_time":extra.get("first_hard_breach_time"),
     }
 
 
 def objective(m):
-    if not m or m.get("hard_stopped"):
+    """Continuous research-ranking score with an explicit DD-breach penalty."""
+    if not m:
         return -1e9
     sh = m.get("sharpe_365", -1)
     if not np.isfinite(sh):
         sh = -1
-    # V5 intentionally prioritizes CAGR while keeping a strong DD penalty.
-    return m["cagr"] - 1.10*abs(m["max_drawdown"]) + 0.06*sh
+    pf = m.get("profit_factor_daily", 0.0)
+    if not np.isfinite(pf):
+        pf = 5.0
+    mdd = abs(m["max_drawdown"])
+    excess = max(0.0, mdd - 0.15)
+    breach_penalty = 0.08 * int(m.get("hard_breached", False)) + 2.0 * excess
+    return (
+        m["cagr"]
+        - 1.10 * mdd
+        + 0.06 * sh
+        + 0.015 * min(pf, 5.0)
+        - breach_penalty
+    )
 
 
 def run_candidates(data, costs, rules, initial, delay=1):
     rows=[]; outputs={}
     for s in CANDIDATES:
         print(f"[TEST] {s.name}", flush=True)
-        eq,tr,ev,ex = backtest(data,s,costs,rules,initial,delay)
-        m=metrics(eq,tr,ex,initial)
-        rows.append({"strategy":s.name, **m, "score":objective(m)})
-        outputs[s.name]=(eq,tr,ev,m)
+        seq,str_,sev,sex = backtest(
+            data,s,costs,rules,initial,delay,enforce_hard_stop=False
+        )
+        sm = metrics(seq,str_,sex,initial)
+        req,rtr,rev,rex = backtest(
+            data,s,costs,rules,initial,delay,enforce_hard_stop=True
+        )
+        rm = metrics(req,rtr,rex,initial)
+        row = {
+            "strategy":s.name,
+            **{f"shadow_{k}":v for k,v in sm.items()},
+            "risk_final_usd":rm["final_usd"],
+            "risk_total_return":rm["total_return"],
+            "risk_cagr":rm["cagr"],
+            "risk_mdd":rm["max_drawdown"],
+            "risk_sharpe":rm["sharpe_365"],
+            "risk_pf_daily":rm["profit_factor_daily"],
+            "risk_hard_stopped":rm["hard_stopped"],
+            "score":objective(sm),
+        }
+        rows.append(row)
+        outputs[s.name] = {
+            "shadow":(seq,str_,sev,sm),
+            "risk":(req,rtr,rev,rm),
+        }
     return pd.DataFrame(rows).sort_values("score",ascending=False), outputs
 
 
 def walk_forward(data, costs, rules, initial):
-    # 3-year train, 1-year OOS, rolled yearly.
     start=data.index.min().normalize(); end=data.index.max().normalize()
     rows=[]; anchor=start
     while anchor + pd.DateOffset(years=4) <= end + pd.Timedelta(days=1):
@@ -590,25 +649,37 @@ def walk_forward(data, costs, rules, initial):
         test=data.loc[(data.index>=test_start)&(data.index<=test_end)]
         if len(train)<15000 or len(test)<4000:
             anchor += pd.DateOffset(years=1); continue
+
         scored=[]
         for s in CANDIDATES:
-            eq,tr,ev,ex=backtest(train,s,costs,rules,initial)
+            eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False)
             m=metrics(eq,tr,ex,initial)
             scored.append((objective(m),s,m))
         scored.sort(key=lambda z:z[0], reverse=True)
         _, chosen, tm = scored[0]
-        eq,tr,ev,ex=backtest(test,chosen,costs,rules,initial)
-        om=metrics(eq,tr,ex,initial)
+
+        seq,str_,sev,sex=backtest(test,chosen,costs,rules,initial,enforce_hard_stop=False)
+        sm=metrics(seq,str_,sex,initial)
+        req,rtr,rev,rex=backtest(test,chosen,costs,rules,initial,enforce_hard_stop=True)
+        rm=metrics(req,rtr,rex,initial)
+
         rows.append({
             "train_start":anchor,"train_end":train_end,
             "test_start":test_start,"test_end":test_end,
             "chosen":chosen.name,
-            "train_cagr":tm["cagr"],"train_mdd":tm["max_drawdown"],
-            "test_return":om["total_return"],"test_cagr":om["cagr"],
-            "test_mdd":om["max_drawdown"],"test_sharpe":om["sharpe_365"],
-            "test_pf_daily":om["profit_factor_daily"],
-            "test_rebalances":om["rebalances"],
-            "test_hard_stopped":om["hard_stopped"],
+            "train_shadow_cagr":tm["cagr"],
+            "train_shadow_mdd":tm["max_drawdown"],
+            "train_shadow_score":objective(tm),
+            "test_shadow_return":sm["total_return"],
+            "test_shadow_cagr":sm["cagr"],
+            "test_shadow_mdd":sm["max_drawdown"],
+            "test_shadow_sharpe":sm["sharpe_365"],
+            "test_shadow_pf_daily":sm["profit_factor_daily"],
+            "test_shadow_hard_breached":sm["hard_breached"],
+            "test_risk_return":rm["total_return"],
+            "test_risk_cagr":rm["cagr"],
+            "test_risk_mdd":rm["max_drawdown"],
+            "test_risk_hard_stopped":rm["hard_stopped"],
         })
         anchor += pd.DateOffset(years=1)
     return pd.DataFrame(rows)
@@ -624,14 +695,19 @@ def robustness_grid(data, best: Strategy, costs, rules, initial):
                 slow_days=max(best.fast_days+20, int(round(best.slow_days*slow_mult))),
                 breakout_4h=max(12, int(round(best.breakout_4h*breakout_mult))),
             )
-            eq,tr,ev,ex=backtest(data,s,costs,rules,initial)
-            m=metrics(eq,tr,ex,initial)
+            seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False)
+            sm=metrics(seq,str_,sex,initial)
+            req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
+            rm=metrics(req,rtr,rex,initial)
             rows.append({
                 "slow_mult":slow_mult,"breakout_mult":breakout_mult,
                 "slow_days":s.slow_days,"breakout_4h":s.breakout_4h,
-                "cagr":m["cagr"],"mdd":m["max_drawdown"],
-                "sharpe":m["sharpe_365"],"pf_daily":m["profit_factor_daily"],
-                "hard_stopped":m["hard_stopped"],
+                "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
+                "shadow_sharpe":sm["sharpe_365"],
+                "shadow_pf_daily":sm["profit_factor_daily"],
+                "shadow_hard_breached":sm["hard_breached"],
+                "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
+                "risk_hard_stopped":rm["hard_stopped"],
             })
     return pd.DataFrame(rows)
 
@@ -679,30 +755,60 @@ def benchmark_buyhold(df1h, initial):
     }
 
 
-def acceptance(best_m, wf, stress_m, delay_m, robust):
+def acceptance(best_shadow, best_risk, wf, stress_shadow, stress_risk,
+               delay_shadow, delay_risk, robust):
     if not wf.empty:
-        oos_total=float((1+wf.test_return).prod()-1)
+        oos_total=float((1+wf.test_risk_return).prod()-1)
         years=len(wf)
         oos_cagr=float((1+oos_total)**(1/years)-1) if 1+oos_total>0 else -1.0
-        pos_ratio=float((wf.test_return>0).mean())
-        worst_oos_mdd=float(wf.test_mdd.min())
+        pos_ratio=float((wf.test_risk_return>0).mean())
+        worst_oos_mdd=float(wf.test_risk_mdd.min())
+        oos_stop_ratio=float(wf.test_risk_hard_stopped.mean())
     else:
-        oos_cagr=np.nan; pos_ratio=np.nan; worst_oos_mdd=np.nan
+        oos_cagr=np.nan; pos_ratio=np.nan; worst_oos_mdd=np.nan; oos_stop_ratio=np.nan
+
     return {
-        "full_cagr_ge_25pct":bool(best_m["cagr"]>=0.25),
-        "full_mdd_le_15pct":bool(abs(best_m["max_drawdown"])<=0.15),
-        "full_sharpe_ge_1_3":bool(best_m["sharpe_365"]>=1.3),
-        "full_pf_daily_ge_1_4":bool(best_m["profit_factor_daily"]>=1.4),
-        "oos_compound_cagr":oos_cagr,
-        "oos_positive_window_ratio":pos_ratio,
-        "oos_worst_window_mdd":worst_oos_mdd,
-        "stress_2x_positive_cagr":bool(stress_m["cagr"]>0),
-        "stress_2x_not_hard_stopped":bool(not stress_m["hard_stopped"]),
-        "delay_positive_cagr":bool(delay_m["cagr"]>0),
-        "robust_positive_cagr_ratio":float((robust.cagr>0).mean()),
-        "robust_all_survive_hard_stop":bool((~robust.hard_stopped).all()),
+        "full_shadow_cagr_ge_25pct":bool(best_shadow["cagr"]>=0.25),
+        "full_shadow_mdd_le_15pct":bool(abs(best_shadow["max_drawdown"])<=0.15),
+        "full_shadow_sharpe_ge_1_3":bool(best_shadow["sharpe_365"]>=1.3),
+        "full_shadow_pf_daily_ge_1_4":bool(best_shadow["profit_factor_daily"]>=1.4),
+        "full_risk_policy_not_hard_stopped":bool(not best_risk["hard_stopped"]),
+        "oos_risk_compound_cagr":oos_cagr,
+        "oos_risk_positive_window_ratio":pos_ratio,
+        "oos_risk_worst_window_mdd":worst_oos_mdd,
+        "oos_hard_stop_window_ratio":oos_stop_ratio,
+        "stress_2x_shadow_positive_cagr":bool(stress_shadow["cagr"]>0),
+        "stress_2x_risk_not_hard_stopped":bool(not stress_risk["hard_stopped"]),
+        "delay_shadow_positive_cagr":bool(delay_shadow["cagr"]>0),
+        "delay_risk_not_hard_stopped":bool(not delay_risk["hard_stopped"]),
+        "robust_shadow_positive_cagr_ratio":float((robust.shadow_cagr>0).mean()),
+        "robust_risk_survival_ratio":float((~robust.risk_hard_stopped).mean()),
     }
 
+
+
+def stress_periods(eq: pd.DataFrame):
+    periods = [
+        ("2018_bear", "2018-01-01", "2018-12-31"),
+        ("2020_crash", "2020-02-01", "2020-05-31"),
+        ("2021_cycle", "2021-01-01", "2021-12-31"),
+        ("2022_bear", "2022-01-01", "2022-12-31"),
+        ("2024", "2024-01-01", "2024-12-31"),
+        ("2025_2026_recent", "2025-01-01", "2026-08-25"),
+    ]
+    rows=[]
+    for name,a,b in periods:
+        g=eq.loc[(eq.index>=pd.Timestamp(a,tz="UTC")) &
+                 (eq.index<=pd.Timestamp(b,tz="UTC"))]
+        if len(g)<2:
+            continue
+        rows.append({
+            "period":name,"start":str(g.index[0]),"end":str(g.index[-1]),
+            "return":float(g.equity.iloc[-1]/g.equity.iloc[0]-1),
+            "within_period_mdd":float((g.equity/g.equity.cummax()-1).min()),
+            "avg_abs_exposure":float(g.target_exposure.abs().mean()),
+        })
+    return pd.DataFrame(rows)
 
 def pct(x):
     return "n/a" if x is None or not np.isfinite(x) else f"{100*x:.2f}%"
@@ -728,41 +834,65 @@ def main():
     cand.to_csv(out/"candidate_summary.csv",index=False)
     best_name=str(cand.iloc[0].strategy)
     best_s=next(s for s in CANDIDATES if s.name==best_name)
-    eq,tr,ev,bm=outputs[best_name]
-    eq.to_csv(out/"equity.csv")
-    tr.to_csv(out/"campaigns.csv",index=False)
-    ev.to_csv(out/"events.csv",index=False)
-    yearly(eq).to_csv(out/"yearly.csv",index=False)
+
+    seq,str_,sev,bsm=outputs[best_name]["shadow"]
+    req,rtr,rev,brm=outputs[best_name]["risk"]
+
+    seq.to_csv(out/"equity_shadow.csv")
+    req.to_csv(out/"equity_risk_gated.csv")
+    str_.to_csv(out/"campaigns_shadow.csv",index=False)
+    sev.to_csv(out/"events_shadow.csv",index=False)
+    yearly(seq).to_csv(out/"yearly_shadow.csv",index=False)
+    yearly(req).to_csv(out/"yearly_risk_gated.csv",index=False)
+    stress_periods(seq).to_csv(out/"stress_periods_shadow.csv",index=False)
 
     wf=walk_forward(data,costs,rules,args.initial)
     wf.to_csv(out/"walk_forward.csv",index=False)
 
-    # 2x transaction-cost stress.
     stress_costs=CostModel(args.fee_bps*2,args.slippage_bps*2)
-    stress_rows=[]; stress_map={}
+    stress_rows=[]; stress_shadow_map={}; stress_risk_map={}
     for s in CANDIDATES:
-        e,t,v,x=backtest(data,s,stress_costs,rules,args.initial)
-        m=metrics(e,t,x,args.initial)
-        stress_rows.append({"strategy":s.name,**m}); stress_map[s.name]=m
+        se,st,sv,sx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=False)
+        sm=metrics(se,st,sx,args.initial)
+        re,rt,rv,rx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=True)
+        rm=metrics(re,rt,rx,args.initial)
+        stress_shadow_map[s.name]=sm; stress_risk_map[s.name]=rm
+        stress_rows.append({
+            "strategy":s.name,
+            "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
+            "shadow_sharpe":sm["sharpe_365"],"shadow_pf":sm["profit_factor_daily"],
+            "shadow_hard_breached":sm["hard_breached"],
+            "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
+            "risk_hard_stopped":rm["hard_stopped"],
+        })
     pd.DataFrame(stress_rows).to_csv(out/"cost_stress_2x.csv",index=False)
 
-    # One additional 4H bar of signal latency.
-    delay_rows=[]; delay_map={}
+    delay_rows=[]; delay_shadow_map={}; delay_risk_map={}
     for s in CANDIDATES:
-        e,t,v,x=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2)
-        m=metrics(e,t,x,args.initial)
-        delay_rows.append({"strategy":s.name,**m}); delay_map[s.name]=m
+        se,st,sv,sx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=False)
+        sm=metrics(se,st,sx,args.initial)
+        re,rt,rv,rx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=True)
+        rm=metrics(re,rt,rx,args.initial)
+        delay_shadow_map[s.name]=sm; delay_risk_map[s.name]=rm
+        delay_rows.append({
+            "strategy":s.name,
+            "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
+            "shadow_sharpe":sm["sharpe_365"],
+            "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
+            "risk_hard_stopped":rm["hard_stopped"],
+        })
     pd.DataFrame(delay_rows).to_csv(out/"execution_delay_stress.csv",index=False)
 
-    # Core-only and no-short attribution for the selected candidate.
-    ecore,tcore,vcore,xcore=backtest(data,best_s,costs,rules,args.initial,tactical_enabled=False)
-    mcore=metrics(ecore,tcore,xcore,args.initial)
-    enoshort,tnoshort,vnoshort,xnoshort=backtest(data,best_s,costs,rules,args.initial,shorts_enabled=False)
-    mnoshort=metrics(enoshort,tnoshort,xnoshort,args.initial)
+    ce,ct,cv,cx=backtest(data,best_s,costs,rules,args.initial,
+                         tactical_enabled=False,enforce_hard_stop=False)
+    core_m=metrics(ce,ct,cx,args.initial)
+    ne,nt,nv,nx=backtest(data,best_s,costs,rules,args.initial,
+                         shorts_enabled=False,enforce_hard_stop=False)
+    no_short_m=metrics(ne,nt,nx,args.initial)
     pd.DataFrame([
-        {"variant":"V5 full",**bm},
-        {"variant":"core only",**mcore},
-        {"variant":"no shorts",**mnoshort},
+        {"variant":"selected shadow",**bsm},
+        {"variant":"core only shadow",**core_m},
+        {"variant":"no shorts shadow",**no_short_m},
     ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
@@ -770,59 +900,96 @@ def main():
 
     bh=benchmark_buyhold(data,args.initial)
     sma=benchmark_sma200(data,args.initial)
-    gates=acceptance(bm,wf,stress_map[best_name],delay_map[best_name],robust)
+    gates=acceptance(
+        bsm,brm,wf,
+        stress_shadow_map[best_name],stress_risk_map[best_name],
+        delay_shadow_map[best_name],delay_risk_map[best_name],
+        robust
+    )
 
-    krw=pd.DataFrame(index=eq.index)
-    krw["strategy_equity_krw"]=10_000_000*(eq.equity/args.initial)
+    krw=pd.DataFrame(index=seq.index)
+    krw["shadow_equity_krw"]=10_000_000*(seq.equity/args.initial)
+    krw["risk_gated_equity_krw"]=10_000_000*(req.equity/args.initial)
     krw.to_csv(out/"krw_10m_projection.csv")
 
+    primary_pass = (
+        gates["full_shadow_cagr_ge_25pct"] and
+        gates["full_shadow_mdd_le_15pct"] and
+        gates["full_shadow_sharpe_ge_1_3"] and
+        gates["full_shadow_pf_daily_ge_1_4"] and
+        gates["full_risk_policy_not_hard_stopped"] and
+        gates["stress_2x_risk_not_hard_stopped"] and
+        gates["delay_risk_not_hard_stopped"] and
+        gates["oos_hard_stop_window_ratio"] == 0
+    )
+
     summary={
-        "version":"V5 Core + Tactical",
+        "version":"V5.1 Evaluation Fix + V5C Family",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
-        "rows_1h":len(data),"best_full_sample":best_name,
-        "best_metrics":bm,"core_only_metrics":mcore,"no_short_metrics":mnoshort,
-        "buy_hold":bh,"sma200_long_cash":sma,"acceptance":gates,
+        "rows_1h":len(data),
+        "selected_candidate":best_name,
+        "selection_method":"shadow risk-adjusted score + explicit hard-breach penalty",
+        "selected_shadow_metrics":bsm,
+        "selected_risk_gated_metrics":brm,
+        "core_only_shadow_metrics":core_m,
+        "no_short_shadow_metrics":no_short_m,
+        "buy_hold":bh,
+        "sma200_long_cash":sma,
+        "acceptance":gates,
+        "overall_pass":bool(primary_pass),
+        "research_note":(
+            "V5.1 was designed after observing V1-V5 results. Its walk-forward "
+            "windows are useful robustness checks but are NOT pristine untouched "
+            "out-of-sample evidence for the overall research program."
+        ),
         "assumptions":{
             "price_source":"Binance BTCUSDT spot 1H price proxy",
             "fee_bps_per_rebalance":costs.fee_bps,
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
+            "hard_stop_policy":"15% terminal stop in risk-gated run; non-terminal shadow run for ranking diagnostics",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V5 — Core + Tactical Backtest Report","",
+        "# BTC AI EA V5.1 — Evaluation Fix + V5C Family","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
-        f"- Best full-sample candidate: **{best_name}**",
-        f"- CAGR: **{pct(bm['cagr'])}**",
-        f"- Total return: **{pct(bm['total_return'])}**",
-        f"- Max drawdown: **{pct(bm['max_drawdown'])}**",
-        f"- Sharpe: **{bm['sharpe_365']:.2f}**",
-        f"- Daily profit factor: **{bm['profit_factor_daily']:.2f}**",
-        f"- Rebalances: **{bm['rebalances']}**",
-        f"- Costs: **${bm['costs_paid_usd']:.2f}**",
-        f"- Core-only CAGR: **{pct(mcore['cagr'])}**",
-        f"- No-short CAGR: **{pct(mnoshort['cagr'])}**",
+        f"- Selected candidate: **{best_name}**",
+        f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
+        f"- Shadow Sharpe / PF: **{bsm['sharpe_365']:.2f} / {bsm['profit_factor_daily']:.2f}**",
+        f"- Shadow hard-DD breached: **{bsm['hard_breached']}** ({bsm['hard_breach_count']} crossings)",
+        f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
+        f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
+        f"- Core-only shadow CAGR: **{pct(core_m['cagr'])}**",
+        f"- No-short shadow CAGR: **{pct(no_short_m['cagr'])}**",
         f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
         f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
-        "","## Candidate comparison","",cand.to_markdown(index=False),
-        "","## Walk-forward OOS","",wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
-        "","## Attribution","",
-        pd.DataFrame([
-            {"variant":"V5 full",**bm},
-            {"variant":"core only",**mcore},
-            {"variant":"no shorts",**mnoshort},
-        ]).to_markdown(index=False),
-        "","## Acceptance gates","","```json",json.dumps(gates,indent=2,default=str),"```",
-        "","## Decision rule","",
-        "V5 is not live-ready unless OOS, 2x-cost, latency and nearby-parameter tests remain acceptable. "
-        "Even a strong backtest must still pass perpetual-futures/funding validation and paper trading."
+        f"- Overall acceptance: **{'PASS' if primary_pass else 'FAIL'}**",
+        "",
+        "## Candidate comparison","",
+        cand.to_markdown(index=False),
+        "",
+        "## Walk-forward OOS robustness","",
+        wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
+        "",
+        "## Nearby-parameter robustness","",
+        robust.to_markdown(index=False),
+        "",
+        "## Acceptance gates","",
+        "```json",json.dumps(gates,indent=2,default=str),"```",
+        "",
+        "## Research integrity note","",
+        summary["research_note"],
+        "",
+        "## Decision rule","",
+        "Do not deploy live unless the risk-gated policy survives, OOS windows do not "
+        "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V5 COMPLETE ===")
+    print("\n=== V5.1 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
