@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V7.1 Proactive Market-Risk Backtester
+BTC AI EA — V7.2 Volatility-Budget Backtester
 ==============================================
 
-Why V7 exists
+Why V7.2 exists
 -------------
 V5.1 produced the strongest return engine so far, while V6 showed that cutting
 risk only after account drawdown is already visible sacrifices too much upside.
-V7 therefore removes the progressive account-drawdown throttle and moves the
-defence upstream into completed DAILY market data.
+V7.1 proved that the return engine has value, but its best candidate still
+carried a roughly 27% shadow drawdown. V7.2 keeps the V7.1D return/risk engine
+fixed and adds a separate volatility-budget layer that caps exposure during
+realized-volatility expansion, including while the broader trend remains bullish.
 
 Architecture
 ------------
 1) CORE: slow daily BTC bull-trend exposure inherited from V5.1.
 2) TACTICAL: 4H breakout sleeve, long only.
-3) PROACTIVE MARKET RISK: 20/50/200-day trend damage, 5/20-day downside
-   momentum, drawdown from the 20-day high, realized-volatility expansion,
-   and shock detection.
-4) HYSTERESIS: risk escalates immediately but exposure is restored only after
-   several completed daily bars confirm recovery.
-5) CIRCUIT BREAKERS: daily/weekly loss locks and a separate 15% terminal
+3) PROACTIVE MARKET RISK: V7.1 trend/momentum/shock state machine.
+4) VOLATILITY BUDGET: independent NORMAL/WARN/HIGH state from absolute 30-day
+   realized volatility plus volatility expansion versus its 90-day median.
+   This layer caps both core and tactical exposure even in a bullish regime.
+5) HYSTERESIS: market risk and volatility budget escalate immediately but
+   exposure is restored only after completed daily bars confirm recovery.
+6) CIRCUIT BREAKERS: daily/weekly loss locks and a separate 15% terminal
    research gate. The 15% gate does not drive normal position sizing.
 
 Risk states
 -----------
 NORMAL -> CAUTION -> DEFENSIVE -> PANIC
 
-The design objective is to preserve V5.1-like bull participation while reducing
-exposure BEFORE large strategy drawdowns emerge. No account high-water-mark
+The design objective is to keep at least ~20% research CAGR if possible while
+compressing shadow MDD toward 15%, without using account drawdown as an ordinary
+position-sizing input. No account high-water-mark
 throttle is used in the ordinary shadow run.
 
 Anti-lookahead rules
@@ -82,6 +86,13 @@ class Strategy:
     vol_target: float
     vol_floor_scale: float
     max_long: float
+    budget_rv_warn: float
+    budget_rv_high: float
+    budget_ratio_warn: float
+    budget_ratio_high: float
+    budget_scale_warn: float
+    budget_scale_high: float
+    budget_recovery_days: int
     risk_fast_days: int
     risk_mid_days: int
     risk_slow_days: int
@@ -96,50 +107,60 @@ class Strategy:
 
 
 CANDIDATES = [
-    # Closest to V5.1C90L: full bull participation, moderate proactive cuts.
+    # V7.1D_STICKY engine is intentionally frozen. Only volatility-budget
+    # thresholds/scales vary so the V7.2 experiment isolates the new layer.
     Strategy(
-        "V7A_BALANCED",
-        fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.72, weak_long=0.36, tactical_long=0.27,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
-        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.99,
-        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
-        mom5_cut=-0.105, mom20_cut=-0.18, high20_cut=-0.16, rv_ratio_cut=1.50,
-        caution_scale=0.70, defense_scale=0.35, panic_scale=0.00, recovery_days=3,
-    ),
-    # Slightly more permissive to protect CAGR.
-    Strategy(
-        "V7B_GROWTH",
-        fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.76, weak_long=0.38, tactical_long=0.28,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.7,
-        breakout_buffer_atr=0.08, vol_target=0.58, vol_floor_scale=0.56,
-        max_long=1.04,
-        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
-        mom5_cut=-0.115, mom20_cut=-0.19, high20_cut=-0.17, rv_ratio_cut=1.55,
-        caution_scale=0.76, defense_scale=0.42, panic_scale=0.04, recovery_days=2,
-    ),
-    # Faster and harder de-risking.
-    Strategy(
-        "V7C_DEFENSIVE",
-        fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.70, weak_long=0.34, tactical_long=0.24,
-        breakout_4h=42, exit_4h=18, trail_atr_4h=4.3,
-        breakout_buffer_atr=0.09, vol_target=0.53, vol_floor_scale=0.52,
-        max_long=0.94,
-        risk_fast_days=15, risk_mid_days=45, risk_slow_days=180,
-        mom5_cut=-0.085, mom20_cut=-0.15, high20_cut=-0.13, rv_ratio_cut=1.38,
-        caution_scale=0.62, defense_scale=0.26, panic_scale=0.00, recovery_days=3,
-    ),
-    # Tests whether slower recovery, rather than harder exits, improves whipsaw.
-    Strategy(
-        "V7D_STICKY",
+        "V72A_MILD",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.26,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.98,
+        budget_rv_warn=0.85, budget_rv_high=1.10,
+        budget_ratio_warn=1.35, budget_ratio_high=1.75,
+        budget_scale_warn=0.90, budget_scale_high=0.68, budget_recovery_days=2,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
+        caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
+    ),
+    Strategy(
+        "V72B_BALANCED",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.26,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.98,
+        budget_rv_warn=0.75, budget_rv_high=1.00,
+        budget_ratio_warn=1.25, budget_ratio_high=1.60,
+        budget_scale_warn=0.82, budget_scale_high=0.55, budget_recovery_days=3,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
+        caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
+    ),
+    Strategy(
+        "V72C_DEFENSIVE",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.26,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.98,
+        budget_rv_warn=0.70, budget_rv_high=0.92,
+        budget_ratio_warn=1.20, budget_ratio_high=1.50,
+        budget_scale_warn=0.76, budget_scale_high=0.45, budget_recovery_days=3,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
+        caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
+    ),
+    Strategy(
+        "V72D_STICKY_BUDGET",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.26,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=0.98,
+        budget_rv_warn=0.78, budget_rv_high=1.00,
+        budget_ratio_warn=1.22, budget_ratio_high=1.55,
+        budget_scale_warn=0.84, budget_scale_high=0.50, budget_recovery_days=5,
         risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
         mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
@@ -162,7 +183,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v7/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v7.2/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -436,6 +457,46 @@ def hysteresis_update(current: str | None, raw: str, recovery_count: int,
     return LEVEL_STATE[new_level], 0
 
 
+BUDGET_LEVEL = {"NORMAL":0, "WARN":1, "HIGH":2}
+BUDGET_STATE = {v:k for k,v in BUDGET_LEVEL.items()}
+
+
+def raw_vol_budget_state(rv: float, rv_ratio: float, s: Strategy) -> str:
+    """Independent volatility-budget severity from completed daily data."""
+    high = (
+        (np.isfinite(rv) and rv >= s.budget_rv_high) or
+        (np.isfinite(rv_ratio) and rv_ratio >= s.budget_ratio_high)
+    )
+    if high:
+        return "HIGH"
+    warn = (
+        (np.isfinite(rv) and rv >= s.budget_rv_warn) or
+        (np.isfinite(rv_ratio) and rv_ratio >= s.budget_ratio_warn)
+    )
+    return "WARN" if warn else "NORMAL"
+
+
+def budget_hysteresis_update(current: str | None, raw: str, recovery_count: int,
+                             recovery_days: int):
+    if current is None:
+        return raw, 0
+    c = BUDGET_LEVEL[current]; r = BUDGET_LEVEL[raw]
+    if r >= c:
+        return raw, 0
+    recovery_count += 1
+    if recovery_count < recovery_days:
+        return current, recovery_count
+    return BUDGET_STATE[max(r, c - 1)], 0
+
+
+def volatility_budget_scale(state: str, s: Strategy) -> float:
+    if state == "WARN":
+        return s.budget_scale_warn
+    if state == "HIGH":
+        return s.budget_scale_high
+    return 1.0
+
+
 def market_scale_for_state(state: str, s: Strategy) -> float:
     if state == "CAUTION":
         return s.caution_scale
@@ -446,17 +507,20 @@ def market_scale_for_state(state: str, s: Strategy) -> float:
     return 1.0
 
 
-def target_exposure(regime: str, rv: float, tactical_side: int, s: Strategy,
-                    market_state: str, market_risk_enabled: bool = True):
+def target_exposure(regime: str, rv: float, rv_ratio: float, tactical_side: int,
+                    s: Strategy, market_state: str, budget_state: str,
+                    market_risk_enabled: bool = True,
+                    vol_budget_enabled: bool = True):
     vscale = vol_scale(rv, s)
     core = core_exposure(regime, s) * vscale
     tactical = 0.0
     if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
-        if market_state in ("NORMAL", "CAUTION"):
+        if market_state in ("NORMAL", "CAUTION") and budget_state != "HIGH":
             tactical = s.tactical_long * vscale
     mscale = market_scale_for_state(market_state, s) if market_risk_enabled else 1.0
-    exp = (core + tactical) * mscale
-    return float(np.clip(exp, 0.0, s.max_long)), mscale
+    bscale = volatility_budget_scale(budget_state, s) if vol_budget_enabled else 1.0
+    exp = (core + tactical) * mscale * bscale
+    return float(np.clip(exp, 0.0, s.max_long)), mscale, bscale
 
 
 def trade_cost(delta_notional: float, costs: CostModel) -> float:
@@ -468,6 +532,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
              initial: float = 10_000.0, signal_delay_bars: int = 1,
              tactical_enabled: bool = True, enforce_hard_stop: bool = True,
              market_risk_enabled: bool = True, hysteresis_enabled: bool = True,
+             vol_budget_enabled: bool = True,
              trade_start: pd.Timestamp | None = None):
     x = build_features(df1h, s).dropna(
         subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid",
@@ -519,6 +584,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_exposure = 0.0
     last_regime = None
     last_risk_state = None
+    last_budget_state = None
 
     # Hysteresis updates only when a NEW completed daily bar becomes available.
     effective_risk_state = None
@@ -526,6 +592,9 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_daily_seq = None
     last_raw_state = "NORMAL"
     last_warning_count = 0
+    effective_budget_state = None
+    budget_recovery_count = 0
+    last_raw_budget_state = "NORMAL"
 
     def set_position(ts, px, desired_exp, reason):
         nonlocal equity, qty, total_costs, rebalance_count, last_exposure
@@ -585,9 +654,21 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             else:
                 effective_risk_state = raw_state
                 recovery_count = 0
+
+            raw_budget = raw_vol_budget_state(rv, rv_ratio, s)
+            last_raw_budget_state = raw_budget
+            if hysteresis_enabled:
+                effective_budget_state, budget_recovery_count = budget_hysteresis_update(
+                    effective_budget_state, raw_budget, budget_recovery_count,
+                    s.budget_recovery_days
+                )
+            else:
+                effective_budget_state = raw_budget
+                budget_recovery_count = 0
             last_daily_seq = daily_seq
 
         risk_state = effective_risk_state or last_raw_state
+        budget_state = effective_budget_state or last_raw_budget_state
         warning_count = last_warning_count
 
         if pending_tactical is not None:
@@ -596,7 +677,8 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             if remaining <= 0:
                 if action == "ENTER":
                     if (regime in ("BULL_STRONG", "BULL_WEAK") and
-                            risk_state in ("NORMAL", "CAUTION") and not hard_stopped):
+                            risk_state in ("NORMAL", "CAUTION") and
+                            budget_state != "HIGH" and not hard_stopped):
                         tactical_side = pside
                         tactical_peak = o
                 else:
@@ -609,20 +691,25 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         desired = 0.0
         reason = "MODEL"
         mscale = 0.0
+        bscale = 0.0
         if hard_stopped or day_lock or week_lock:
             reason = "LOCK"
         else:
-            desired, mscale = target_exposure(
-                regime, rv, tactical_side if tactical_enabled else 0, s,
-                risk_state, market_risk_enabled=market_risk_enabled,
+            desired, mscale, bscale = target_exposure(
+                regime, rv, rv_ratio, tactical_side if tactical_enabled else 0, s,
+                risk_state, budget_state,
+                market_risk_enabled=market_risk_enabled,
+                vol_budget_enabled=vol_budget_enabled,
             )
 
         if (abs(desired - last_exposure) >= 0.025 or
                 regime != last_regime or risk_state != last_risk_state or
+                budget_state != last_budget_state or
                 (desired == 0 and abs(last_exposure) > 1e-12)):
             set_position(ts, o, desired, reason)
         last_regime = regime
         last_risk_state = risk_state
+        last_budget_state = budget_state
 
         if abs(qty) > 0:
             bars_exposed += 1
@@ -648,12 +735,13 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
         if tactical_enabled and not hard_stopped:
             buf = s.breakout_buffer_atr * a
-            if risk_state in ("DEFENSIVE", "PANIC") and tactical_side > 0:
+            if (risk_state in ("DEFENSIVE", "PANIC") or budget_state == "HIGH") and tactical_side > 0:
                 if pending_tactical is None:
                     pending_tactical = ("EXIT", +1, max(1, signal_delay_bars))
             elif tactical_side == 0 and pending_tactical is None:
                 if (regime in ("BULL_STRONG", "BULL_WEAK") and
                         risk_state in ("NORMAL", "CAUTION") and
+                        budget_state != "HIGH" and
                         c > float(r.entry_hi) + buf):
                     pending_tactical = ("ENTER", +1, max(1, signal_delay_bars))
             elif tactical_side > 0:
@@ -669,6 +757,9 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             "target_exposure":last_exposure, "regime":regime,
             "raw_risk_state":last_raw_state, "risk_state":risk_state,
             "risk_warning_count":warning_count, "market_scale":mscale,
+            "raw_budget_state":last_raw_budget_state, "budget_state":budget_state,
+            "vol_budget_scale":bscale, "budget_recovery_count":budget_recovery_count,
+            "rv30":rv, "rv_ratio":rv_ratio,
             "recovery_count":recovery_count, "drawdown":dd,
             "tactical_side":tactical_side, "day_lock":day_lock, "week_lock":week_lock,
         })
@@ -863,12 +954,17 @@ def walk_forward(data, costs, rules, initial):
 
 def robustness_grid(data, best: Strategy, costs, rules, initial):
     rows=[]
-    for slow_mult in (0.8,1.0,1.2):
+    for budget_mult in (0.8,1.0,1.2):
         for exp_mult in (0.8,1.0,1.2):
+            # Scale absolute RV thresholds directly; scale only the excess over
+            # 1.0 for RV-ratio thresholds so the neighborhood remains sensible.
             s=replace(
                 best,
-                name=f"{best.name}_S{slow_mult:.1f}_E{exp_mult:.1f}",
-                slow_days=max(best.fast_days+20, int(round(best.slow_days*slow_mult))),
+                name=f"{best.name}_B{budget_mult:.1f}_E{exp_mult:.1f}",
+                budget_rv_warn=max(0.35, best.budget_rv_warn*budget_mult),
+                budget_rv_high=max(0.50, best.budget_rv_high*budget_mult),
+                budget_ratio_warn=1.0+(best.budget_ratio_warn-1.0)*budget_mult,
+                budget_ratio_high=1.0+(best.budget_ratio_high-1.0)*budget_mult,
                 strong_long=min(1.15, best.strong_long*exp_mult),
                 weak_long=min(0.70, best.weak_long*exp_mult),
                 tactical_long=min(0.40, best.tactical_long*exp_mult),
@@ -879,8 +975,10 @@ def robustness_grid(data, best: Strategy, costs, rules, initial):
             req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
             rm=metrics(req,rtr,rex,initial)
             rows.append({
-                "slow_mult":slow_mult,"exposure_mult":exp_mult,
-                "slow_days":s.slow_days,"max_long":s.max_long,
+                "budget_threshold_mult":budget_mult,"exposure_mult":exp_mult,
+                "budget_rv_warn":s.budget_rv_warn,"budget_rv_high":s.budget_rv_high,
+                "budget_ratio_warn":s.budget_ratio_warn,"budget_ratio_high":s.budget_ratio_high,
+                "max_long":s.max_long,
                 "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
                 "shadow_sharpe":sm["sharpe_365"],
                 "shadow_pf_daily":sm["profit_factor_daily"],
@@ -901,6 +999,7 @@ def yearly(eq):
             "within_year_mdd":float((g.equity/g.equity.cummax()-1).min()),
             "avg_exposure":float(g.target_exposure.abs().mean()),
             "defensive_panic_fraction":float(g.risk_state.isin(["DEFENSIVE","PANIC"]).mean()) if "risk_state" in g else np.nan,
+            "vol_budget_high_fraction":float((g.budget_state=="HIGH").mean()) if "budget_state" in g else np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -948,6 +1047,7 @@ def acceptance(best_shadow, best_risk, wf, stress_shadow, stress_risk,
         oos_cagr=np.nan; pos_ratio=np.nan; worst_oos_mdd=np.nan; oos_stop_ratio=np.nan
 
     return {
+        "development_shadow_cagr_ge_20pct":bool(best_shadow["cagr"]>=0.20),
         "full_shadow_cagr_ge_25pct":bool(best_shadow["cagr"]>=0.25),
         "full_shadow_mdd_le_15pct":bool(abs(best_shadow["max_drawdown"])<=0.15),
         "full_shadow_sharpe_ge_1_3":bool(best_shadow["sharpe_365"]>=1.3),
@@ -990,6 +1090,7 @@ def stress_periods(eq: pd.DataFrame):
             "defensive_panic_fraction":float(
                 g.risk_state.isin(["DEFENSIVE","PANIC"]).mean()
             ) if "risk_state" in g else np.nan,
+            "vol_budget_high_fraction":float((g.budget_state=="HIGH").mean()) if "budget_state" in g else np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -1037,6 +1138,16 @@ def main():
         ).reset_index()
         rs["fraction"] = rs["bars"] / max(len(seq), 1)
         rs.to_csv(out/"risk_state_distribution.csv", index=False)
+    if "budget_state" in seq.columns:
+        bs = seq.groupby("budget_state").agg(
+            bars=("equity","size"),
+            avg_exposure=("target_exposure","mean"),
+            avg_abs_exposure=("target_exposure",lambda z: z.abs().mean()),
+            avg_rv30=("rv30","mean"),
+            avg_rv_ratio=("rv_ratio","mean"),
+        ).reset_index()
+        bs["fraction"] = bs["bars"] / max(len(seq), 1)
+        bs.to_csv(out/"vol_budget_distribution.csv", index=False)
 
     wf=walk_forward(data,costs,rules,args.initial)
     wf.to_csv(out/"walk_forward.csv",index=False)
@@ -1075,6 +1186,11 @@ def main():
         })
     pd.DataFrame(delay_rows).to_csv(out/"execution_delay_stress.csv",index=False)
 
+    nbe,nbt,nbv,nbx=backtest(
+        data,best_s,costs,rules,args.initial,
+        enforce_hard_stop=False,vol_budget_enabled=False
+    )
+    no_budget_m=metrics(nbe,nbt,nbx,args.initial)
     ce,ct,cv,cx=backtest(
         data,best_s,costs,rules,args.initial,
         tactical_enabled=False,enforce_hard_stop=False
@@ -1082,7 +1198,8 @@ def main():
     core_m=metrics(ce,ct,cx,args.initial)
     be,bt,bv,bx=backtest(
         data,best_s,costs,rules,args.initial,
-        enforce_hard_stop=False, market_risk_enabled=False
+        enforce_hard_stop=False, market_risk_enabled=False,
+        vol_budget_enabled=False
     )
     base_engine_m=metrics(be,bt,bx,args.initial)
     re0,rt0,rv0,rx0=backtest(
@@ -1091,8 +1208,9 @@ def main():
     )
     raw_overlay_m=metrics(re0,rt0,rx0,args.initial)
     pd.DataFrame([
-        {"variant":"selected full V7 proactive + hysteresis",**bsm},
-        {"variant":"core only",**core_m},
+        {"variant":"selected full V7.2 proactive + volatility budget",**bsm},
+        {"variant":"same engine with volatility budget disabled",**no_budget_m},
+        {"variant":"core only with volatility budget",**core_m},
         {"variant":"base return engine (market overlay disabled)",**base_engine_m},
         {"variant":"raw proactive overlay (hysteresis disabled)",**raw_overlay_m},
     ]).to_csv(out/"attribution.csv",index=False)
@@ -1126,13 +1244,14 @@ def main():
     )
 
     summary={
-        "version":"V7 Proactive Market Risk",
+        "version":"V7.2 Volatility Budget",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),
         "selected_candidate":best_name,
         "selection_method":"MDD<=15% candidates first, then continuous risk-adjusted score",
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
+        "no_vol_budget_shadow_metrics":no_budget_m,
         "core_only_shadow_metrics":core_m,
         "base_engine_shadow_metrics":base_engine_m,
         "raw_overlay_shadow_metrics":raw_overlay_m,
@@ -1141,7 +1260,7 @@ def main():
         "acceptance":gates,
         "overall_pass":bool(primary_pass),
         "research_note":(
-            "V7 was designed after observing V1-V6 results. Its walk-forward "
+            "V7.2 was designed after observing V1-V7.1 results. Its walk-forward "
             "windows are useful robustness checks but are NOT pristine untouched "
             "out-of-sample evidence for the overall research program."
         ),
@@ -1151,14 +1270,14 @@ def main():
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "hard_stop_policy":"proactive market-state scaling plus a separate 15% terminal stop in risk-gated run; no progressive account-DD sizing in shadow run",
+            "hard_stop_policy":"proactive market-state scaling + independent volatility budget + separate 15% terminal stop in risk-gated run; no progressive account-DD sizing in shadow run",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V7 — Proactive Market Risk","",
+        "# BTC AI EA V7.2 — Volatility Budget","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
         f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
@@ -1166,6 +1285,7 @@ def main():
         f"- Shadow hard-DD breached: **{bsm['hard_breached']}** ({bsm['hard_breach_count']} crossings)",
         f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
         f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
+        f"- Same engine without volatility budget CAGR / MDD: **{pct(no_budget_m['cagr'])} / {pct(no_budget_m['max_drawdown'])}**",
         f"- Core-only shadow CAGR: **{pct(core_m['cagr'])}**",
         f"- Base-engine CAGR (no market overlay): **{pct(base_engine_m['cagr'])}**",
         f"- Raw-overlay CAGR (no hysteresis): **{pct(raw_overlay_m['cagr'])}**",
@@ -1189,11 +1309,11 @@ def main():
         summary["research_note"],
         "",
         "## Decision rule","",
-        "Do not deploy live unless V7 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
+        "Do not deploy live unless V7.2 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V7 COMPLETE ===")
+    print("\n=== V7.2 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
