@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V5.1 Core + Tactical Evaluation Backtester
-================================================
+BTC AI EA — V6 Dynamic Risk Overlay Backtester
+==============================================
 
-Why V5.1 exists
+Why V6 exists
 -------------
-V4 reduced turnover and drawdown, but captured too little of BTC's secular upside.
-V5.1 keeps the V5 architecture but fixes the evaluation engine and focuses on the V5C family:
+V5.1 finally produced a meaningful return engine, but its ~31% maximum drawdown
+and weak walk-forward persistence were unacceptable. V6 keeps the proven
+Core + Tactical long architecture and changes the RISK LAYER rather than chasing
+a new entry signal.
 
-  1) CORE: slow daily trend exposure designed to stay invested through major bull legs.
-  2) TACTICAL: smaller 4H breakout sleeve that adds only when trend accelerates.
+Architecture
+------------
+1) CORE: slow daily BTC bull-trend exposure.
+2) TACTICAL: 4H breakout sleeve, long only.
+3) MARKET RISK OVERLAY: 20/50-day trend damage, 5/20-day downside momentum,
+   realized-volatility expansion, and shock detection.
+4) ACCOUNT DD OVERLAY: exposure is progressively reduced as strategy equity
+   falls from its high-water mark.
+5) CIRCUIT BREAKERS: daily/weekly loss locks plus a 15% terminal research gate.
 
-The design is asymmetric by construction:
-- long exposure is the primary return engine;
-- shorts are small and allowed only in strong daily bear regimes;
-- no martingale, no averaging down, no simultaneous long/short hedge.
+Risk states
+-----------
+NORMAL -> CAUTION -> DEFENSIVE -> PANIC
+
+The overlay is designed to reduce exposure before a 15% account drawdown is hit,
+then allow measured recovery when market conditions normalize. It does NOT reset
+the historical equity high-water mark and therefore cannot cosmetically erase
+drawdown.
 
 Anti-lookahead rules
 --------------------
-- Daily regime uses only a fully completed prior daily candle.
-- 4H tactical signals use only a fully completed 4H candle.
-- Position changes execute at a later 4H OPEN.
+- Daily risk/regime features use only a fully completed prior daily candle.
+- 4H tactical signals use only a fully completed prior 4H candle.
+- Rebalances execute at a later 4H OPEN.
 
 Phase-1 price source
 --------------------
 Binance BTCUSDT spot 1H public archives are used as a long-history PRICE proxy.
-Funding, basis, liquidation and perpetual-specific microstructure are intentionally
-reserved for the later futures-validation phase.
+Funding, basis, liquidation and perpetual-specific microstructure remain deferred
+to later futures validation.
 """
 
 from __future__ import annotations
@@ -60,9 +73,7 @@ class Strategy:
     slope_days: int
     strong_long: float
     weak_long: float
-    strong_short: float
     tactical_long: float
-    tactical_short: float
     breakout_4h: int
     exit_4h: int
     trail_atr_4h: float
@@ -70,43 +81,64 @@ class Strategy:
     vol_target: float
     vol_floor_scale: float
     max_long: float
-    max_short: float
-    shock_scale: float
+    risk_fast_days: int
+    risk_mid_days: int
+    mom5_cut: float
+    mom20_cut: float
+    rv_ratio_cut: float
+    caution_scale: float
+    defense_scale: float
+    panic_scale: float
 
 
 CANDIDATES = [
-    # V5C baseline from the previous run. Kept as a fixed reference.
+    # Direct descendant of V5.1C90L with the new V6 risk overlay.
     Strategy(
-        "V5.1C100", fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.80, weak_long=0.40, strong_short=-0.20,
-        tactical_long=0.30, tactical_short=-0.10,
+        "V6A_BALANCED",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.27,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=1.10, max_short=0.30, shock_scale=0.45,
+        max_long=0.99,
+        risk_fast_days=20, risk_mid_days=50,
+        mom5_cut=-0.10, mom20_cut=-0.17, rv_ratio_cut=1.45,
+        caution_scale=0.72, defense_scale=0.40, panic_scale=0.12,
     ),
+    # More upside participation, but the same pre-emptive risk controls.
     Strategy(
-        "V5.1C90", fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.72, weak_long=0.36, strong_short=-0.18,
-        tactical_long=0.27, tactical_short=-0.09,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
-        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.99, max_short=0.27, shock_scale=0.45,
+        "V6B_GROWTH",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.82, weak_long=0.40, tactical_long=0.28,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.8,
+        breakout_buffer_atr=0.08, vol_target=0.60, vol_floor_scale=0.58,
+        max_long=1.10,
+        risk_fast_days=20, risk_mid_days=50,
+        mom5_cut=-0.11, mom20_cut=-0.18, rv_ratio_cut=1.50,
+        caution_scale=0.75, defense_scale=0.43, panic_scale=0.14,
     ),
+    # Explicitly drawdown-first.
     Strategy(
-        "V5.1C80", fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.64, weak_long=0.32, strong_short=-0.16,
-        tactical_long=0.24, tactical_short=-0.08,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
-        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.88, max_short=0.24, shock_scale=0.45,
+        "V6C_DEFENSIVE",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.64, weak_long=0.30, tactical_long=0.20,
+        breakout_4h=45, exit_4h=18, trail_atr_4h=4.2,
+        breakout_buffer_atr=0.10, vol_target=0.50, vol_floor_scale=0.50,
+        max_long=0.84,
+        risk_fast_days=15, risk_mid_days=45,
+        mom5_cut=-0.08, mom20_cut=-0.14, rv_ratio_cut=1.35,
+        caution_scale=0.65, defense_scale=0.32, panic_scale=0.06,
     ),
+    # Slightly faster market-risk response without lowering normal bull exposure.
     Strategy(
-        "V5.1C90L", fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.72, weak_long=0.36, strong_short=0.0,
-        tactical_long=0.27, tactical_short=0.0,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        "V6D_FAST_RISK",
+        fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.25,
+        breakout_4h=35, exit_4h=18, trail_atr_4h=4.2,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.99, max_short=0.0, shock_scale=0.45,
+        max_long=0.97,
+        risk_fast_days=15, risk_mid_days=40,
+        mom5_cut=-0.09, mom20_cut=-0.15, rv_ratio_cut=1.40,
+        caution_scale=0.68, defense_scale=0.36, panic_scale=0.08,
     ),
 ]
 
@@ -126,7 +158,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v5.1/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v6/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -239,8 +271,8 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
-    # 4H bars are labeled at bar OPEN. State changes from the completed bar are
-    # applied to a later bar open in backtest().
+    # 4H bars are labeled at bar OPEN. The bar's signal can only be acted upon
+    # at a later 4H open.
     h4 = df1h[["open", "high", "low", "close", "volume"]].resample(
         "4h", closed="left", label="left"
     ).agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}).dropna()
@@ -250,38 +282,62 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
     h4["exit_hi"] = h4["high"].shift(1).rolling(s.exit_4h).max()
     h4["exit_lo"] = h4["low"].shift(1).rolling(s.exit_4h).min()
 
-    # Daily bar labeled at NEXT midnight, meaning all daily features are known at
-    # that timestamp and can safely be merge_asof'ed backward onto 4H bars.
+    # Daily bar is labeled at NEXT midnight. Therefore these features are fully
+    # known at that timestamp before merge_asof propagates them to later 4H bars.
     d = df1h[["open", "high", "low", "close", "volume"]].resample(
         "1D", closed="left", label="right"
     ).agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}).dropna()
-    d["fast"] = d["close"].ewm(span=s.fast_days, adjust=False, min_periods=s.fast_days).mean()
-    d["slow"] = d["close"].ewm(span=s.slow_days, adjust=False, min_periods=s.slow_days).mean()
+
+    # Slow return-engine regime.
+    d["fast"] = d["close"].ewm(
+        span=s.fast_days, adjust=False, min_periods=s.fast_days
+    ).mean()
+    d["slow"] = d["close"].ewm(
+        span=s.slow_days, adjust=False, min_periods=s.slow_days
+    ).mean()
     d["slow_slope"] = d["slow"] - d["slow"].shift(s.slope_days)
-    r = d["close"].pct_change()
-    d["rv30"] = r.rolling(30, min_periods=20).std() * np.sqrt(365)
+
+    strong_bull = (
+        (d["close"] > d["slow"]) &
+        (d["fast"] > d["slow"]) &
+        (d["slow_slope"] > 0)
+    )
+    weak_bull = (d["close"] > d["slow"]) & ~strong_bull
+    d["regime"] = "NEUTRAL"
+    d.loc[weak_bull, "regime"] = "BULL_WEAK"
+    d.loc[strong_bull, "regime"] = "BULL_STRONG"
+
+    # Faster V6 risk sensors.
+    d["risk_fast"] = d["close"].ewm(
+        span=s.risk_fast_days, adjust=False, min_periods=s.risk_fast_days
+    ).mean()
+    d["risk_mid"] = d["close"].ewm(
+        span=s.risk_mid_days, adjust=False, min_periods=s.risk_mid_days
+    ).mean()
+    ret = d["close"].pct_change()
+    d["ret5"] = d["close"].pct_change(5)
+    d["ret20"] = d["close"].pct_change(20)
+    d["rv30"] = ret.rolling(30, min_periods=20).std() * np.sqrt(365)
+    d["rv90_med"] = d["rv30"].rolling(90, min_periods=45).median()
+    d["rv_ratio"] = d["rv30"] / d["rv90_med"].replace(0, np.nan)
     d["atr_pct"] = atr(d, 14) / d["close"]
     d["shock_cut"] = d["atr_pct"].rolling(540, min_periods=180).quantile(0.95)
     d["shock"] = (
         (d["atr_pct"] > d["shock_cut"]) |
-        (r.abs() > 3.0 * r.rolling(60, min_periods=30).std())
+        (ret.abs() > 3.0 * ret.rolling(60, min_periods=30).std())
     ).fillna(False)
-
-    strong_bull = (d["close"] > d["slow"]) & (d["fast"] > d["slow"]) & (d["slow_slope"] > 0)
-    weak_bull = (d["close"] > d["slow"]) & ~strong_bull
-    strong_bear = (d["close"] < d["slow"]) & (d["fast"] < d["slow"]) & (d["slow_slope"] < 0)
-    weak_bear = (d["close"] < d["slow"]) & ~strong_bear
-
-    d["regime"] = "NEUTRAL"
-    d.loc[weak_bull, "regime"] = "BULL_WEAK"
-    d.loc[strong_bull, "regime"] = "BULL_STRONG"
-    d.loc[weak_bear, "regime"] = "BEAR_WEAK"
-    d.loc[strong_bear, "regime"] = "BEAR_STRONG"
+    d["dclose"] = d["close"]
 
     left = h4.reset_index().rename(columns={h4.index.name or "index":"time"})
-    right = d[["regime", "rv30", "shock", "fast", "slow", "slow_slope"]].reset_index()
+    right = d[[
+        "regime", "rv30", "rv_ratio", "shock", "fast", "slow", "slow_slope",
+        "risk_fast", "risk_mid", "ret5", "ret20", "dclose"
+    ]].reset_index()
     right = right.rename(columns={right.columns[0]:"time"})
-    x = pd.merge_asof(left.sort_values("time"), right.sort_values("time"), on="time", direction="backward")
+    x = pd.merge_asof(
+        left.sort_values("time"), right.sort_values("time"),
+        on="time", direction="backward"
+    )
     return x.set_index("time")
 
 
@@ -295,8 +351,6 @@ def core_exposure(regime: str, s: Strategy) -> float:
         return s.strong_long
     if regime == "BULL_WEAK":
         return s.weak_long
-    if regime == "BEAR_STRONG":
-        return s.strong_short
     return 0.0
 
 
@@ -306,23 +360,74 @@ def vol_scale(rv: float, s: Strategy) -> float:
     return float(np.clip(s.vol_target / rv, s.vol_floor_scale, 1.0))
 
 
-def target_exposure(regime: str, rv: float, shock: bool, tactical_side: int,
-                    s: Strategy, soft_dd: bool) -> float:
-    scale = vol_scale(rv, s)
-    core = core_exposure(regime, s) * scale
-    tactical = 0.0
-    if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
-        tactical = s.tactical_long * scale
-    elif tactical_side < 0 and regime == "BEAR_STRONG":
-        tactical = s.tactical_short * scale
+def market_risk_state(dclose: float, risk_fast: float, risk_mid: float,
+                      ret5: float, ret20: float, rv_ratio: float,
+                      shock: bool, s: Strategy):
+    """Return state, scale, warning count using only completed daily data."""
+    warnings = 0
+    if np.isfinite(dclose) and np.isfinite(risk_mid) and dclose < risk_mid:
+        warnings += 1
+    if np.isfinite(risk_fast) and np.isfinite(risk_mid) and risk_fast < risk_mid:
+        warnings += 1
+    if np.isfinite(ret20) and ret20 < -0.08:
+        warnings += 1
+    if np.isfinite(rv_ratio) and rv_ratio > s.rv_ratio_cut:
+        warnings += 1
 
-    exp = core + tactical
-    if shock:
-        exp *= s.shock_scale
-    if soft_dd:
-        # Cut only the incremental risk; do not instantly dump the secular core.
-        exp *= 0.70
-    return float(np.clip(exp, -s.max_short, s.max_long))
+    panic = (
+        (np.isfinite(ret5) and ret5 <= s.mom5_cut) or
+        (np.isfinite(ret20) and ret20 <= s.mom20_cut) or
+        (shock and np.isfinite(ret5) and ret5 < -0.04)
+    )
+    if panic:
+        return "PANIC", s.panic_scale, warnings
+    if warnings >= 3:
+        return "DEFENSIVE", s.defense_scale, warnings
+    if warnings >= 1:
+        return "CAUTION", s.caution_scale, warnings
+    return "NORMAL", 1.0, warnings
+
+
+def drawdown_risk_scale(dd: float, market_state: str) -> float:
+    """Progressive account-risk throttle based on true all-time drawdown."""
+    if dd > -0.04:
+        scale = 1.00
+    elif dd > -0.07:
+        scale = 0.82
+    elif dd > -0.10:
+        scale = 0.62
+    elif dd > -0.12:
+        scale = 0.42
+    elif dd > -0.14:
+        scale = 0.22
+    else:
+        scale = 0.08
+
+    # Recovery floor: when market risk has fully normalized, keep enough
+    # exposure to recover from a drawdown rather than remaining permanently flat.
+    if dd <= -0.10 and market_state == "NORMAL":
+        scale = max(scale, 0.42)
+    return scale
+
+
+def target_exposure(regime: str, rv: float, tactical_side: int, s: Strategy,
+                    dd_open: float, market_state: str, market_scale: float,
+                    market_risk_enabled: bool = True,
+                    dd_risk_enabled: bool = True):
+    vscale = vol_scale(rv, s)
+    core = core_exposure(regime, s) * vscale
+
+    tactical = 0.0
+    # Tactical risk is disabled entirely in defensive/panic states.
+    if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
+        if market_state in ("NORMAL", "CAUTION"):
+            tactical = s.tactical_long * vscale
+
+    dd_scale = drawdown_risk_scale(dd_open, market_state) if dd_risk_enabled else 1.0
+    mscale = market_scale if market_risk_enabled else 1.0
+    risk_scale = min(mscale, dd_scale)
+    exp = (core + tactical) * risk_scale
+    return float(np.clip(exp, 0.0, s.max_long)), risk_scale, dd_scale, mscale
 
 
 def trade_cost(delta_notional: float, costs: CostModel) -> float:
@@ -332,22 +437,26 @@ def trade_cost(delta_notional: float, costs: CostModel) -> float:
 
 def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules,
              initial: float = 10_000.0, signal_delay_bars: int = 1,
-             tactical_enabled: bool = True, shorts_enabled: bool = True,
-             enforce_hard_stop: bool = True):
-    x = build_features(df1h, s).dropna(subset=["rv30", "atr4h", "regime"])
+             tactical_enabled: bool = True, enforce_hard_stop: bool = True,
+             market_risk_enabled: bool = True, dd_risk_enabled: bool = True):
+    x = build_features(df1h, s).dropna(
+        subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid", "ret20"]
+    )
     if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
 
     equity = initial
-    qty = 0.0  # signed derivative BTC quantity
+    qty = 0.0
     prev_close = None
     peak_equity = initial
+
     current_day = x.index[0].date()
     current_week = week_key(x.index[0])
     day_start = initial
     week_start = initial
     day_lock = False
     week_lock = False
+
     hard_stopped = False
     hard_breached = False
     hard_breach_count = 0
@@ -356,7 +465,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
     tactical_side = 0
     tactical_peak = np.nan
-    pending_tactical = None  # tuple(action, side, bars_remaining)
+    pending_tactical = None  # (action, side, bars_remaining)
 
     total_costs = 0.0
     rebalance_count = 0
@@ -366,6 +475,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     events = []
     last_exposure = 0.0
     last_regime = None
+    last_risk_state = None
 
     def set_position(ts, px, desired_exp, reason):
         nonlocal equity, qty, total_costs, rebalance_count, last_exposure
@@ -389,13 +499,18 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         o, h, l, c, a = map(float, [r.open, r.high, r.low, r.close, r.atr4h])
         regime = str(r.regime)
         rv = float(r.rv30)
+        rv_ratio = float(r.rv_ratio) if np.isfinite(r.rv_ratio) else 1.0
         shock = bool(r.shock)
+        dclose = float(r.dclose)
+        rfast = float(r.risk_fast)
+        rmid = float(r.risk_mid)
+        ret5 = float(r.ret5) if np.isfinite(r.ret5) else 0.0
+        ret20 = float(r.ret20) if np.isfinite(r.ret20) else 0.0
 
         # Mark previous close -> current open before any rebalance.
         if prev_close is not None:
             equity += qty * (o - prev_close)
 
-        # Reset day/week locks on the fresh marked-to-market open.
         if ts.date() != current_day:
             current_day = ts.date()
             day_start = equity
@@ -408,16 +523,22 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
         peak_equity = max(peak_equity, equity)
         dd_open = equity / peak_equity - 1.0
-        soft_dd = dd_open <= -rules.soft_drawdown
 
-        # Apply a tactical state change that was generated by a COMPLETED prior 4H bar.
+        risk_state, market_scale, warning_count = market_risk_state(
+            dclose, rfast, rmid, ret5, ret20, rv_ratio, shock, s
+        )
+
+        # A completed prior-bar tactical transition is only allowed to enter if
+        # current risk conditions are still acceptable. Exits always execute.
         if pending_tactical is not None:
             action, pside, remaining = pending_tactical
             remaining -= 1
             if remaining <= 0:
                 if action == "ENTER":
-                    tactical_side = pside
-                    tactical_peak = o
+                    if (regime in ("BULL_STRONG", "BULL_WEAK") and
+                            risk_state in ("NORMAL", "CAUTION") and not hard_stopped):
+                        tactical_side = pside
+                        tactical_peak = o
                 else:
                     tactical_side = 0
                     tactical_peak = np.nan
@@ -425,45 +546,42 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             else:
                 pending_tactical = (action, pside, remaining)
 
-        if not shorts_enabled and tactical_side < 0:
-            tactical_side = 0
-            tactical_peak = np.nan
-
-        # Locks / hard stop override all model exposures.
         desired = 0.0
         reason = "MODEL"
+        risk_scale = dd_scale = mscale = 0.0
         if hard_stopped or day_lock or week_lock:
-            desired = 0.0
             reason = "LOCK"
         else:
-            desired = target_exposure(regime, rv, shock,
-                                      tactical_side if tactical_enabled else 0,
-                                      s, soft_dd)
-            if not shorts_enabled:
-                desired = max(0.0, desired)
+            desired, risk_scale, dd_scale, mscale = target_exposure(
+                regime, rv, tactical_side if tactical_enabled else 0, s,
+                dd_open, risk_state, market_scale,
+                market_risk_enabled=market_risk_enabled,
+                dd_risk_enabled=dd_risk_enabled,
+            )
 
-        # Rebalance whenever exposure target materially changes or daily regime changes.
-        if (abs(desired - last_exposure) >= 0.025 or regime != last_regime or
+        # Rebalance on a material target change, regime transition, or risk-state
+        # transition. 2.5 percentage-point deadband limits transaction-cost churn.
+        if (abs(desired - last_exposure) >= 0.025 or
+                regime != last_regime or risk_state != last_risk_state or
                 (desired == 0 and abs(last_exposure) > 1e-12)):
             set_position(ts, o, desired, reason)
         last_regime = regime
+        last_risk_state = risk_state
 
         if abs(qty) > 0:
             bars_exposed += 1
 
-        # Mark current 4H open -> close. This deliberately avoids using intrabar
-        # highs/lows for portfolio PnL while still allowing them to update a future
-        # tactical trailing reference.
+        # Current 4H PnL.
         equity += qty * (c - o)
         peak_equity = max(peak_equity, equity)
         dd = equity / peak_equity - 1.0
 
-        # Risk locks are evaluated after the completed 4H candle and flatten on
-        # the next bar open, avoiding same-bar hindsight fills.
+        # Existing daily/weekly circuit breakers.
         if day_start > 0 and equity / day_start - 1 <= -rules.daily_loss_lock:
             day_lock = True
         if week_start > 0 and equity / week_start - 1 <= -rules.weekly_loss_lock:
             week_lock = True
+
         below_hard = dd <= -rules.hard_drawdown
         if below_hard and not was_below_hard:
             hard_breached = True
@@ -474,14 +592,17 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 hard_stopped = True
         was_below_hard = below_hard
 
-        # Generate tactical transition for a FUTURE 4H open.
+        # Generate a tactical transition for a FUTURE 4H open.
         if tactical_enabled and not hard_stopped:
             buf = s.breakout_buffer_atr * a
-            if tactical_side == 0 and pending_tactical is None:
-                if regime in ("BULL_STRONG", "BULL_WEAK") and c > float(r.entry_hi) + buf:
+            if risk_state in ("DEFENSIVE", "PANIC") and tactical_side > 0:
+                if pending_tactical is None:
+                    pending_tactical = ("EXIT", +1, max(1, signal_delay_bars))
+            elif tactical_side == 0 and pending_tactical is None:
+                if (regime in ("BULL_STRONG", "BULL_WEAK") and
+                        risk_state in ("NORMAL", "CAUTION") and
+                        c > float(r.entry_hi) + buf):
                     pending_tactical = ("ENTER", +1, max(1, signal_delay_bars))
-                elif shorts_enabled and regime == "BEAR_STRONG" and c < float(r.entry_lo) - buf:
-                    pending_tactical = ("ENTER", -1, max(1, signal_delay_bars))
             elif tactical_side > 0:
                 tactical_peak = max(tactical_peak, h) if np.isfinite(tactical_peak) else h
                 trail = tactical_peak - s.trail_atr_4h * a
@@ -489,23 +610,18 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                         c < float(r.exit_lo) or c < trail):
                     if pending_tactical is None:
                         pending_tactical = ("EXIT", +1, max(1, signal_delay_bars))
-            elif tactical_side < 0:
-                tactical_peak = min(tactical_peak, l) if np.isfinite(tactical_peak) else l
-                trail = tactical_peak + s.trail_atr_4h * a
-                if regime != "BEAR_STRONG" or c > float(r.exit_hi) or c > trail:
-                    if pending_tactical is None:
-                        pending_tactical = ("EXIT", -1, max(1, signal_delay_bars))
 
         rows.append({
             "time":ts, "equity":equity, "qty":qty,
             "target_exposure":last_exposure, "regime":regime,
+            "risk_state":risk_state, "risk_warning_count":warning_count,
+            "risk_scale":risk_scale, "market_scale":mscale, "dd_scale":dd_scale,
             "tactical_side":tactical_side, "drawdown":dd,
             "day_lock":day_lock, "week_lock":week_lock,
         })
         prev_close = c
 
     eqdf = pd.DataFrame(rows).set_index("time")
-    # Flat-at-end accounting cost, so reported final equity is realizable.
     if abs(qty) > 0 and not eqdf.empty:
         px = float(x.iloc[-1].close)
         cost = trade_cost(qty * px, costs)
@@ -515,21 +631,16 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         eqdf.iloc[-1, eqdf.columns.get_loc("qty")] = 0.0
         eqdf.iloc[-1, eqdf.columns.get_loc("target_exposure")] = 0.0
 
-    # Create exposure-regime "campaigns" from contiguous non-zero exposure periods.
-    e = eqdf.copy()
-    active = e.target_exposure.abs() > 1e-9
+    # Contiguous exposure campaigns.
+    active = eqdf.target_exposure.abs() > 1e-9
     starts = active & ~active.shift(1, fill_value=False)
     ends = active & ~active.shift(-1, fill_value=False)
-    start_times = list(e.index[starts])
-    end_times = list(e.index[ends])
-    for st, en in zip(start_times, end_times):
-        g = e.loc[st:en]
+    for st, en in zip(list(eqdf.index[starts]), list(eqdf.index[ends])):
+        g = eqdf.loc[st:en]
         p0 = float(g.equity.iloc[0]); p1 = float(g.equity.iloc[-1])
-        avgexp = float(g.target_exposure.mean())
         trades.append({
-            "entry_time":st, "exit_time":en,
-            "direction":"LONG" if avgexp > 0 else "SHORT",
-            "avg_exposure":avgexp,
+            "entry_time":st, "exit_time":en, "direction":"LONG",
+            "avg_exposure":float(g.target_exposure.mean()),
             "return":p1/p0 - 1 if p0 > 0 else np.nan,
         })
 
@@ -537,9 +648,10 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     evdf = pd.DataFrame(events)
     extra = {
         "costs":total_costs, "hard_stopped":hard_stopped,
-        "hard_breached":hard_breached,
-        "hard_breach_count":hard_breach_count,
-        "first_hard_breach_time":str(first_hard_breach_time) if first_hard_breach_time is not None else None,
+        "hard_breached":hard_breached, "hard_breach_count":hard_breach_count,
+        "first_hard_breach_time":(
+            str(first_hard_breach_time) if first_hard_breach_time is not None else None
+        ),
         "bars_exposed":bars_exposed, "bars_total":len(eqdf),
         "rebalances":rebalance_count,
     }
@@ -585,7 +697,7 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
 
 
 def objective(m):
-    """Continuous research-ranking score with an explicit DD-breach penalty."""
+    """Risk-first research ranking; no equal-score cliff when the 15% gate fails."""
     if not m:
         return -1e9
     sh = m.get("sharpe_365", -1)
@@ -596,13 +708,13 @@ def objective(m):
         pf = 5.0
     mdd = abs(m["max_drawdown"])
     excess = max(0.0, mdd - 0.15)
-    breach_penalty = 0.08 * int(m.get("hard_breached", False)) + 2.0 * excess
     return (
         m["cagr"]
-        - 1.10 * mdd
-        + 0.06 * sh
-        + 0.015 * min(pf, 5.0)
-        - breach_penalty
+        - 1.55 * mdd
+        + 0.08 * sh
+        + 0.02 * min(pf, 5.0)
+        - 7.0 * excess
+        - 0.10 * int(m.get("hard_breached", False))
     )
 
 
@@ -628,6 +740,7 @@ def run_candidates(data, costs, rules, initial, delay=1):
             "risk_sharpe":rm["sharpe_365"],
             "risk_pf_daily":rm["profit_factor_daily"],
             "risk_hard_stopped":rm["hard_stopped"],
+            "mdd_gate":bool(abs(sm["max_drawdown"]) <= rules.hard_drawdown),
             "score":objective(sm),
         }
         rows.append(row)
@@ -635,7 +748,7 @@ def run_candidates(data, costs, rules, initial, delay=1):
             "shadow":(seq,str_,sev,sm),
             "risk":(req,rtr,rev,rm),
         }
-    return pd.DataFrame(rows).sort_values("score",ascending=False), outputs
+    return pd.DataFrame(rows).sort_values(["mdd_gate","score"],ascending=[False,False]), outputs
 
 
 def walk_forward(data, costs, rules, initial):
@@ -654,9 +767,9 @@ def walk_forward(data, costs, rules, initial):
         for s in CANDIDATES:
             eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False)
             m=metrics(eq,tr,ex,initial)
-            scored.append((objective(m),s,m))
-        scored.sort(key=lambda z:z[0], reverse=True)
-        _, chosen, tm = scored[0]
+            scored.append((abs(m["max_drawdown"]) <= rules.hard_drawdown, objective(m), s, m))
+        scored.sort(key=lambda z:(z[0], z[1]), reverse=True)
+        _, _, chosen, tm = scored[0]
 
         seq,str_,sev,sex=backtest(test,chosen,costs,rules,initial,enforce_hard_stop=False)
         sm=metrics(seq,str_,sex,initial)
@@ -688,20 +801,23 @@ def walk_forward(data, costs, rules, initial):
 def robustness_grid(data, best: Strategy, costs, rules, initial):
     rows=[]
     for slow_mult in (0.8,1.0,1.2):
-        for breakout_mult in (0.8,1.0,1.2):
+        for exp_mult in (0.8,1.0,1.2):
             s=replace(
                 best,
-                name=f"{best.name}_S{slow_mult:.1f}_B{breakout_mult:.1f}",
+                name=f"{best.name}_S{slow_mult:.1f}_E{exp_mult:.1f}",
                 slow_days=max(best.fast_days+20, int(round(best.slow_days*slow_mult))),
-                breakout_4h=max(12, int(round(best.breakout_4h*breakout_mult))),
+                strong_long=min(1.15, best.strong_long*exp_mult),
+                weak_long=min(0.70, best.weak_long*exp_mult),
+                tactical_long=min(0.40, best.tactical_long*exp_mult),
+                max_long=min(1.25, best.max_long*exp_mult),
             )
             seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False)
             sm=metrics(seq,str_,sex,initial)
             req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
             rm=metrics(req,rtr,rex,initial)
             rows.append({
-                "slow_mult":slow_mult,"breakout_mult":breakout_mult,
-                "slow_days":s.slow_days,"breakout_4h":s.breakout_4h,
+                "slow_mult":slow_mult,"exposure_mult":exp_mult,
+                "slow_days":s.slow_days,"max_long":s.max_long,
                 "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
                 "shadow_sharpe":sm["sharpe_365"],
                 "shadow_pf_daily":sm["profit_factor_daily"],
@@ -721,6 +837,7 @@ def yearly(eq):
             "return":float(g.equity.iloc[-1]/g.equity.iloc[0]-1),
             "within_year_mdd":float((g.equity/g.equity.cummax()-1).min()),
             "avg_exposure":float(g.target_exposure.abs().mean()),
+            "defensive_panic_fraction":float(g.risk_state.isin(["DEFENSIVE","PANIC"]).mean()) if "risk_state" in g else np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -807,8 +924,12 @@ def stress_periods(eq: pd.DataFrame):
             "return":float(g.equity.iloc[-1]/g.equity.iloc[0]-1),
             "within_period_mdd":float((g.equity/g.equity.cummax()-1).min()),
             "avg_abs_exposure":float(g.target_exposure.abs().mean()),
+            "defensive_panic_fraction":float(
+                g.risk_state.isin(["DEFENSIVE","PANIC"]).mean()
+            ) if "risk_state" in g else np.nan,
         })
     return pd.DataFrame(rows)
+
 
 def pct(x):
     return "n/a" if x is None or not np.isfinite(x) else f"{100*x:.2f}%"
@@ -845,6 +966,14 @@ def main():
     yearly(seq).to_csv(out/"yearly_shadow.csv",index=False)
     yearly(req).to_csv(out/"yearly_risk_gated.csv",index=False)
     stress_periods(seq).to_csv(out/"stress_periods_shadow.csv",index=False)
+    if "risk_state" in seq.columns:
+        rs = seq.groupby("risk_state").agg(
+            bars=("equity","size"),
+            avg_exposure=("target_exposure","mean"),
+            avg_abs_exposure=("target_exposure",lambda z: z.abs().mean()),
+        ).reset_index()
+        rs["fraction"] = rs["bars"] / max(len(seq), 1)
+        rs.to_csv(out/"risk_state_distribution.csv", index=False)
 
     wf=walk_forward(data,costs,rules,args.initial)
     wf.to_csv(out/"walk_forward.csv",index=False)
@@ -883,16 +1012,26 @@ def main():
         })
     pd.DataFrame(delay_rows).to_csv(out/"execution_delay_stress.csv",index=False)
 
-    ce,ct,cv,cx=backtest(data,best_s,costs,rules,args.initial,
-                         tactical_enabled=False,enforce_hard_stop=False)
+    ce,ct,cv,cx=backtest(
+        data,best_s,costs,rules,args.initial,
+        tactical_enabled=False,enforce_hard_stop=False
+    )
     core_m=metrics(ce,ct,cx,args.initial)
-    ne,nt,nv,nx=backtest(data,best_s,costs,rules,args.initial,
-                         shorts_enabled=False,enforce_hard_stop=False)
-    no_short_m=metrics(ne,nt,nx,args.initial)
+    me,mt,mv,mx=backtest(
+        data,best_s,costs,rules,args.initial,
+        enforce_hard_stop=False, market_risk_enabled=False
+    )
+    no_market_m=metrics(me,mt,mx,args.initial)
+    de,dt,dv,dx=backtest(
+        data,best_s,costs,rules,args.initial,
+        enforce_hard_stop=False, dd_risk_enabled=False
+    )
+    no_dd_m=metrics(de,dt,dx,args.initial)
     pd.DataFrame([
-        {"variant":"selected shadow",**bsm},
-        {"variant":"core only shadow",**core_m},
-        {"variant":"no shorts shadow",**no_short_m},
+        {"variant":"selected full V6 risk overlay",**bsm},
+        {"variant":"core only",**core_m},
+        {"variant":"DD overlay only (market overlay disabled)",**no_market_m},
+        {"variant":"market overlay only (DD overlay disabled)",**no_dd_m},
     ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
@@ -924,21 +1063,22 @@ def main():
     )
 
     summary={
-        "version":"V5.1 Evaluation Fix + V5C Family",
+        "version":"V6 Dynamic Risk Overlay",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),
         "selected_candidate":best_name,
-        "selection_method":"shadow risk-adjusted score + explicit hard-breach penalty",
+        "selection_method":"MDD<=15% candidates first, then continuous risk-adjusted score",
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
         "core_only_shadow_metrics":core_m,
-        "no_short_shadow_metrics":no_short_m,
+        "dd_only_shadow_metrics":no_market_m,
+        "market_only_shadow_metrics":no_dd_m,
         "buy_hold":bh,
         "sma200_long_cash":sma,
         "acceptance":gates,
         "overall_pass":bool(primary_pass),
         "research_note":(
-            "V5.1 was designed after observing V1-V5 results. Its walk-forward "
+            "V6 was designed after observing V1-V5.1 results. Its walk-forward "
             "windows are useful robustness checks but are NOT pristine untouched "
             "out-of-sample evidence for the overall research program."
         ),
@@ -948,14 +1088,14 @@ def main():
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "hard_stop_policy":"15% terminal stop in risk-gated run; non-terminal shadow run for ranking diagnostics",
+            "hard_stop_policy":"dynamic pre-emptive scaling plus 15% terminal stop in risk-gated run; non-terminal shadow run for diagnostics",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V5.1 — Evaluation Fix + V5C Family","",
+        "# BTC AI EA V6 — Dynamic Risk Overlay","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
         f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
@@ -964,7 +1104,8 @@ def main():
         f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
         f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
         f"- Core-only shadow CAGR: **{pct(core_m['cagr'])}**",
-        f"- No-short shadow CAGR: **{pct(no_short_m['cagr'])}**",
+        f"- DD-overlay-only CAGR: **{pct(no_market_m['cagr'])}**",
+        f"- Market-overlay-only CAGR: **{pct(no_dd_m['cagr'])}**",
         f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
         f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
         f"- Overall acceptance: **{'PASS' if primary_pass else 'FAIL'}**",
@@ -985,11 +1126,11 @@ def main():
         summary["research_note"],
         "",
         "## Decision rule","",
-        "Do not deploy live unless the risk-gated policy survives, OOS windows do not "
+        "Do not deploy live unless V6 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V5.1 COMPLETE ===")
+    print("\n=== V6 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
