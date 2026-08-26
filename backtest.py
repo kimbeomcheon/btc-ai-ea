@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V4 Macro Trend Research Backtester
+BTC AI EA — V5 Core + Tactical Trend Backtester
 ================================================
 
-V4 design objective
--------------------
-Fix the main V1-V3 failure modes:
-- too many 1H trades
-- transaction-cost drag
-- weak OOS persistence
-- insufficient participation in major BTC trends
+Why V5 exists
+-------------
+V4 reduced turnover and drawdown, but captured too little of BTC's secular upside.
+V5 deliberately separates the portfolio into:
 
-Architecture
-------------
-1D regime -> 4H breakout -> asymmetric long/short -> winner-only pyramiding
--> ATR stop/trailing -> volatility sizing -> account loss locks
+  1) CORE: slow daily trend exposure designed to stay invested through major bull legs.
+  2) TACTICAL: smaller 4H breakout sleeve that adds only when trend accelerates.
 
-Research rules
---------------
-- Signals only use completed bars.
-- 4H signal is executed at the NEXT 4H bar open.
-- Long and short are asymmetric: BTC long risk is larger; bear shorts are smaller.
-- No martingale, no averaging down, no simultaneous long/short.
-- No parameter optimization inside a single window.
-- Fixed V4A/V4B/V4C families are compared, then walk-forward selected.
-- Binance BTCUSDT spot 1H is a long-history PRICE PROXY.
-- Funding/basis/perpetual-specific data are intentionally deferred to Phase 2.
+The design is asymmetric by construction:
+- long exposure is the primary return engine;
+- shorts are small and allowed only in strong daily bear regimes;
+- no martingale, no averaging down, no simultaneous long/short hedge.
+
+Anti-lookahead rules
+--------------------
+- Daily regime uses only a fully completed prior daily candle.
+- 4H tactical signals use only a fully completed 4H candle.
+- Position changes execute at a later 4H OPEN.
+
+Phase-1 price source
+--------------------
+Binance BTCUSDT spot 1H public archives are used as a long-history PRICE proxy.
+Funding, basis, liquidation and perpetual-specific microstructure are intentionally
+reserved for the later futures-validation phase.
 """
 
 from __future__ import annotations
@@ -33,7 +34,6 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import math
 import time
 import urllib.error
 import urllib.request
@@ -47,69 +47,77 @@ import pandas as pd
 
 BINANCE_VISION = "https://data.binance.vision/data/spot"
 KLINE_COLS = [
-    "open_time","open","high","low","close","volume","close_time",
-    "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"
+    "open_time", "open", "high", "low", "close", "volume", "close_time",
+    "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
 ]
+
 
 @dataclass(frozen=True)
 class Strategy:
     name: str
-    ema_fast: int
-    ema_slow: int
-    adx_min: float
-    entry_lookback_4h: int
-    exit_lookback_4h: int
-    initial_stop_atr: float
-    trail_atr: float
+    fast_days: int
+    slow_days: int
+    slope_days: int
+    strong_long: float
+    weak_long: float
+    strong_short: float
+    tactical_long: float
+    tactical_short: float
+    breakout_4h: int
+    exit_4h: int
+    trail_atr_4h: float
     breakout_buffer_atr: float
     vol_target: float
-    max_leverage: float
-    long_risk_pct: float
-    short_risk_pct: float
-    short_scale: float
-    add1_atr: float = 1.0
-    add2_atr: float = 2.0
-    cooldown_bars: int = 6
-    shock_quantile: float = 0.95
+    vol_floor_scale: float
+    max_long: float
+    max_short: float
+    shock_scale: float
+
 
 CANDIDATES = [
     Strategy(
-        "V4A", ema_fast=50, ema_slow=200, adx_min=18,
-        entry_lookback_4h=30, exit_lookback_4h=14,
-        initial_stop_atr=3.0, trail_atr=5.0, breakout_buffer_atr=0.10,
-        vol_target=0.35, max_leverage=1.25,
-        long_risk_pct=0.008, short_risk_pct=0.004, short_scale=0.50,
+        "V5A", fast_days=100, slow_days=200, slope_days=20,
+        strong_long=0.85, weak_long=0.55, strong_short=-0.15,
+        tactical_long=0.30, tactical_short=-0.10,
+        breakout_4h=30, exit_4h=15, trail_atr_4h=4.0,
+        breakout_buffer_atr=0.05, vol_target=0.65, vol_floor_scale=0.65,
+        max_long=1.20, max_short=0.25, shock_scale=0.50,
     ),
     Strategy(
-        "V4B", ema_fast=75, ema_slow=200, adx_min=20,
-        entry_lookback_4h=55, exit_lookback_4h=20,
-        initial_stop_atr=3.5, trail_atr=6.0, breakout_buffer_atr=0.10,
-        vol_target=0.35, max_leverage=1.25,
-        long_risk_pct=0.008, short_risk_pct=0.004, short_scale=0.45,
+        "V5B", fast_days=50, slow_days=200, slope_days=20,
+        strong_long=1.00, weak_long=0.65, strong_short=-0.10,
+        tactical_long=0.25, tactical_short=-0.08,
+        breakout_4h=55, exit_4h=20, trail_atr_4h=5.0,
+        breakout_buffer_atr=0.05, vol_target=0.70, vol_floor_scale=0.70,
+        max_long=1.25, max_short=0.20, shock_scale=0.55,
     ),
     Strategy(
-        "V4C", ema_fast=100, ema_slow=250, adx_min=18,
-        entry_lookback_4h=80, exit_lookback_4h=30,
-        initial_stop_atr=4.0, trail_atr=7.0, breakout_buffer_atr=0.05,
-        vol_target=0.30, max_leverage=1.50,
-        long_risk_pct=0.008, short_risk_pct=0.0035, short_scale=0.40,
+        "V5C", fast_days=100, slow_days=250, slope_days=30,
+        strong_long=0.80, weak_long=0.40, strong_short=-0.20,
+        tactical_long=0.30, tactical_short=-0.10,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
+        breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
+        max_long=1.10, max_short=0.30, shock_scale=0.45,
     ),
 ]
+
 
 @dataclass(frozen=True)
 class CostModel:
     fee_bps: float = 5.5
     slippage_bps: float = 2.0
 
+
 @dataclass(frozen=True)
 class RiskRules:
     daily_loss_lock: float = 0.02
     weekly_loss_lock: float = 0.05
-    soft_dd: float = 0.10
-    hard_dd: float = 0.15
+    soft_drawdown: float = 0.10
+    hard_drawdown: float = 0.15
+
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v4/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v5/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -124,6 +132,7 @@ def _fetch_bytes(url: str, retries: int = 3) -> bytes:
         time.sleep(1.5 * (i + 1))
     raise RuntimeError(f"Download failed: {url}: {last}")
 
+
 def _parse_kline_csv(raw: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(raw), header=None)
     if df.shape[1] < 6:
@@ -134,9 +143,10 @@ def _parse_kline_csv(raw: bytes) -> pd.DataFrame:
     unit = "us" if t.dropna().median() > 1e14 else "ms"
     idx = pd.to_datetime(t, unit=unit, utc=True, errors="coerce")
     out = pd.DataFrame(index=idx)
-    for c in ["open","high","low","close","volume"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         out[c] = pd.to_numeric(df[c], errors="coerce").to_numpy()
     return out.dropna().sort_index()
+
 
 def _month_starts(start: pd.Timestamp, end: pd.Timestamp):
     cur = pd.Timestamp(start.year, start.month, 1, tz="UTC")
@@ -144,6 +154,7 @@ def _month_starts(start: pd.Timestamp, end: pd.Timestamp):
     while cur <= last:
         yield cur
         cur += pd.offsets.MonthBegin(1)
+
 
 def download_btc_1h(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +182,7 @@ def download_btc_1h(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
             name = next(n for n in z.namelist() if n.endswith(".csv"))
             frames.append(_parse_kline_csv(z.read(name)))
 
-    # current month via completed daily archives
+    # Current month from completed daily archives.
     if end_ts >= current_month:
         d0 = max(start_ts.normalize(), current_month)
         d1 = min(end_ts.normalize(), (now - pd.Timedelta(days=1)).normalize())
@@ -196,15 +207,17 @@ def download_btc_1h(start: str, end: str, cache_dir: Path) -> pd.DataFrame:
     x = pd.concat(frames).sort_index()
     x = x[~x.index.duplicated(keep="last")]
     x = x.loc[(x.index >= start_ts) & (x.index <= end_ts)]
-    bad = ((x["high"] < x[["open","close","low"]].max(axis=1)) |
-           (x["low"] > x[["open","close","high"]].min(axis=1)))
+    bad = ((x["high"] < x[["open", "close", "low"]].max(axis=1)) |
+           (x["low"] > x[["open", "close", "high"]].min(axis=1)))
     if bad.any():
         raise RuntimeError(f"OHLC integrity failure: {int(bad.sum())} rows")
     print(f"[DATA] rows={len(x):,} {x.index.min()} -> {x.index.max()}")
     return x
 
+
 def wilder(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     prev = df["close"].shift(1)
@@ -215,441 +228,375 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return wilder(tr, n)
 
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    up = df["high"].diff()
-    dn = -df["low"].diff()
-    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
-    a = atr(df, n)
-    pdi = 100 * wilder(plus_dm, n) / a.replace(0, np.nan)
-    mdi = 100 * wilder(minus_dm, n) / a.replace(0, np.nan)
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    return wilder(dx, n)
 
 def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
-    # 4H bars labeled at OPEN time. A signal on one row's CLOSE is executed
-    # at the next row's OPEN.
-    h4 = df1h[["open","high","low","close","volume"]].resample(
+    # 4H bars are labeled at bar OPEN. State changes from the completed bar are
+    # applied to a later bar open in backtest().
+    h4 = df1h[["open", "high", "low", "close", "volume"]].resample(
         "4h", closed="left", label="left"
-    ).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-    h4["atr"] = atr(h4, 14)
-    h4["entry_hi"] = h4["high"].shift(1).rolling(s.entry_lookback_4h).max()
-    h4["entry_lo"] = h4["low"].shift(1).rolling(s.entry_lookback_4h).min()
-    h4["exit_hi"] = h4["high"].shift(1).rolling(s.exit_lookback_4h).max()
-    h4["exit_lo"] = h4["low"].shift(1).rolling(s.exit_lookback_4h).min()
+    ).agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}).dropna()
+    h4["atr4h"] = atr(h4, 14)
+    h4["entry_hi"] = h4["high"].shift(1).rolling(s.breakout_4h).max()
+    h4["entry_lo"] = h4["low"].shift(1).rolling(s.breakout_4h).min()
+    h4["exit_hi"] = h4["high"].shift(1).rolling(s.exit_4h).max()
+    h4["exit_lo"] = h4["low"].shift(1).rolling(s.exit_4h).min()
 
-    # Daily bars labeled at the NEXT midnight: at that timestamp the full
-    # previous day's OHLC is known.
-    d = df1h[["open","high","low","close","volume"]].resample(
+    # Daily bar labeled at NEXT midnight, meaning all daily features are known at
+    # that timestamp and can safely be merge_asof'ed backward onto 4H bars.
+    d = df1h[["open", "high", "low", "close", "volume"]].resample(
         "1D", closed="left", label="right"
-    ).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-    d["ema_fast"] = d["close"].ewm(span=s.ema_fast, adjust=False,
-                                    min_periods=s.ema_fast).mean()
-    d["ema_slow"] = d["close"].ewm(span=s.ema_slow, adjust=False,
-                                    min_periods=s.ema_slow).mean()
-    d["adx"] = adx(d, 14)
-    d["slow_slope"] = d["ema_slow"] - d["ema_slow"].shift(10)
-
-    ret = d["close"].pct_change()
-    d["rv30"] = ret.rolling(30, min_periods=20).std() * np.sqrt(365)
+    ).agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}).dropna()
+    d["fast"] = d["close"].ewm(span=s.fast_days, adjust=False, min_periods=s.fast_days).mean()
+    d["slow"] = d["close"].ewm(span=s.slow_days, adjust=False, min_periods=s.slow_days).mean()
+    d["slow_slope"] = d["slow"] - d["slow"].shift(s.slope_days)
+    r = d["close"].pct_change()
+    d["rv30"] = r.rolling(30, min_periods=20).std() * np.sqrt(365)
     d["atr_pct"] = atr(d, 14) / d["close"]
-    d["shock_cut"] = d["atr_pct"].rolling(540, min_periods=180).quantile(s.shock_quantile)
-    sig = ret.rolling(60, min_periods=30).std()
-    shock = ((d["atr_pct"] > d["shock_cut"]) |
-             (ret.abs() > 3.0 * sig))
+    d["shock_cut"] = d["atr_pct"].rolling(540, min_periods=180).quantile(0.95)
+    d["shock"] = (
+        (d["atr_pct"] > d["shock_cut"]) |
+        (r.abs() > 3.0 * r.rolling(60, min_periods=30).std())
+    ).fillna(False)
 
-    bull = (
-        (d["close"] > d["ema_slow"]) &
-        (d["ema_fast"] > d["ema_slow"]) &
-        (d["slow_slope"] > 0) &
-        (d["adx"] >= s.adx_min)
-    )
-    bear = (
-        (d["close"] < d["ema_slow"]) &
-        (d["ema_fast"] < d["ema_slow"]) &
-        (d["slow_slope"] < 0) &
-        (d["adx"] >= s.adx_min)
-    )
-    d["regime"] = "RANGE"
-    d.loc[bull, "regime"] = "BULL"
-    d.loc[bear, "regime"] = "BEAR"
-    d.loc[shock.fillna(False), "regime"] = "SHOCK"
+    strong_bull = (d["close"] > d["slow"]) & (d["fast"] > d["slow"]) & (d["slow_slope"] > 0)
+    weak_bull = (d["close"] > d["slow"]) & ~strong_bull
+    strong_bear = (d["close"] < d["slow"]) & (d["fast"] < d["slow"]) & (d["slow_slope"] < 0)
+    weak_bear = (d["close"] < d["slow"]) & ~strong_bear
+
+    d["regime"] = "NEUTRAL"
+    d.loc[weak_bull, "regime"] = "BULL_WEAK"
+    d.loc[strong_bull, "regime"] = "BULL_STRONG"
+    d.loc[weak_bear, "regime"] = "BEAR_WEAK"
+    d.loc[strong_bear, "regime"] = "BEAR_STRONG"
 
     left = h4.reset_index().rename(columns={h4.index.name or "index":"time"})
-    right = d[["regime","rv30","adx","ema_fast","ema_slow"]].reset_index()
-    right = right.rename(columns={
-        right.columns[0]:"time", "adx":"adx1d",
-        "ema_fast":"ema_fast1d", "ema_slow":"ema_slow1d"
-    })
-    x = pd.merge_asof(left.sort_values("time"), right.sort_values("time"),
-                      on="time", direction="backward")
+    right = d[["regime", "rv30", "shock", "fast", "slow", "slow_slope"]].reset_index()
+    right = right.rename(columns={right.columns[0]:"time"})
+    x = pd.merge_asof(left.sort_values("time"), right.sort_values("time"), on="time", direction="backward")
     return x.set_index("time")
 
-def slip(price: float, side: int, bps: float) -> float:
-    return price * (1 + side * bps / 10_000.0)
 
-def commission(notional: float, bps: float) -> float:
-    return abs(notional) * bps / 10_000.0
-
-def wk(ts: pd.Timestamp):
+def week_key(ts: pd.Timestamp):
     i = ts.isocalendar()
     return (int(i.year), int(i.week))
 
-def target_leverage(eq: float, px: float, a: float, rv: float,
-                    side: int, s: Strategy, soft_dd: bool) -> float:
-    if not np.isfinite(rv) or rv <= 0 or not np.isfinite(a) or a <= 0 or px <= 0:
-        return 0.0
-    vol_lev = s.vol_target / rv
-    risk_pct = s.long_risk_pct if side > 0 else s.short_risk_pct
-    stop_pct = s.initial_stop_atr * a / px
-    risk_lev = risk_pct / stop_pct if stop_pct > 0 else 0.0
-    lev = min(s.max_leverage, vol_lev, risk_lev)
-    if side < 0:
-        lev *= s.short_scale
-    if soft_dd:
-        lev *= 0.50
-    return max(0.0, lev)
 
-def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel,
-             rules: RiskRules, initial: float = 10_000.0, entry_delay_bars: int = 1):
-    d = build_features(df1h, s).dropna(subset=["atr","regime","rv30"])
-    if len(d) < 1500:
+def core_exposure(regime: str, s: Strategy) -> float:
+    if regime == "BULL_STRONG":
+        return s.strong_long
+    if regime == "BULL_WEAK":
+        return s.weak_long
+    if regime == "BEAR_STRONG":
+        return s.strong_short
+    return 0.0
+
+
+def vol_scale(rv: float, s: Strategy) -> float:
+    if not np.isfinite(rv) or rv <= 0:
+        return 1.0
+    return float(np.clip(s.vol_target / rv, s.vol_floor_scale, 1.0))
+
+
+def target_exposure(regime: str, rv: float, shock: bool, tactical_side: int,
+                    s: Strategy, soft_dd: bool) -> float:
+    scale = vol_scale(rv, s)
+    core = core_exposure(regime, s) * scale
+    tactical = 0.0
+    if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
+        tactical = s.tactical_long * scale
+    elif tactical_side < 0 and regime == "BEAR_STRONG":
+        tactical = s.tactical_short * scale
+
+    exp = core + tactical
+    if shock:
+        exp *= s.shock_scale
+    if soft_dd:
+        # Cut only the incremental risk; do not instantly dump the secular core.
+        exp *= 0.70
+    return float(np.clip(exp, -s.max_short, s.max_long))
+
+
+def trade_cost(delta_notional: float, costs: CostModel) -> float:
+    # Fee plus an explicit slippage penalty. Both are charged on every rebalance.
+    return abs(delta_notional) * (costs.fee_bps + costs.slippage_bps) / 10_000.0
+
+
+def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules,
+             initial: float = 10_000.0, signal_delay_bars: int = 1,
+             tactical_enabled: bool = True, shorts_enabled: bool = True):
+    x = build_features(df1h, s).dropna(subset=["rv30", "atr4h", "regime"])
+    if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
 
-    cash = initial
-    qty = 0.0
-    side = 0
-    avg_entry = 0.0
-    first_entry = 0.0
-    entry_atr = 0.0
-    stop = np.nan
-    fav = np.nan
-    target_qty = 0.0
-    add1 = add2 = False
-    campaign_start = initial
-    campaign_time = None
-    cooldown = 0
-    pending = 0
-    pending_count = 0
-
-    fees = 0.0
-    peak = initial
-    hard_stopped = False
-    bars_market = 0
-    current_day = d.index[0].date()
-    current_week = wk(d.index[0])
+    equity = initial
+    qty = 0.0  # signed derivative BTC quantity
+    prev_close = None
+    peak_equity = initial
+    current_day = x.index[0].date()
+    current_week = week_key(x.index[0])
     day_start = initial
     week_start = initial
-    day_lock = week_lock = False
+    day_lock = False
+    week_lock = False
+    hard_stopped = False
 
+    tactical_side = 0
+    tactical_peak = np.nan
+    pending_tactical = None  # tuple(action, side, bars_remaining)
+
+    total_costs = 0.0
+    rebalance_count = 0
+    bars_exposed = 0
+    rows = []
     trades = []
     events = []
-    equity = []
+    last_exposure = 0.0
+    last_regime = None
 
-    def mark(px):
-        if qty <= 0:
-            return cash
-        return cash + side * qty * (px - avg_entry)
+    def set_position(ts, px, desired_exp, reason):
+        nonlocal equity, qty, total_costs, rebalance_count, last_exposure
+        desired_qty = equity * desired_exp / px if px > 0 else 0.0
+        delta = desired_qty - qty
+        notional = delta * px
+        cost = trade_cost(notional, costs)
+        equity -= cost
+        total_costs += cost
+        if abs(delta) > 1e-12:
+            rebalance_count += 1
+            events.append({
+                "time":ts, "event":"REBALANCE", "reason":reason,
+                "price":px, "delta_qty":delta, "cost":cost,
+                "target_exposure":desired_exp,
+            })
+        qty = desired_qty
+        last_exposure = desired_exp
 
-    def open_campaign(ts, new_side, px, a, rv, regime, soft):
-        nonlocal cash, qty, side, avg_entry, first_entry, entry_atr, stop, fav
-        nonlocal target_qty, add1, add2, campaign_start, campaign_time, fees
-        eq = mark(px)
-        lev = target_leverage(eq, px, a, rv, new_side, s, soft)
-        if lev <= 0:
-            return False
-        tq = eq * lev / px
-        q = tq * 0.50
-        if q <= 0:
-            return False
-        fill = slip(px, new_side, costs.slippage_bps)
-        f = commission(fill*q, costs.fee_bps)
-        cash -= f
-        fees += f
-        side = new_side
-        qty = q
-        avg_entry = fill
-        first_entry = fill
-        entry_atr = a
-        target_qty = tq
-        stop = fill - new_side * s.initial_stop_atr * a
-        fav = fill
-        add1 = add2 = False
-        campaign_start = cash + f
-        campaign_time = ts
-        events.append({
-            "time":ts, "event":"ENTRY", "direction":"LONG" if side>0 else "SHORT",
-            "price":fill, "qty":q, "leverage_target":lev, "regime":regime, "fee":f
-        })
-        return True
-
-    def add_to(ts, fraction, px, tag):
-        nonlocal cash, qty, avg_entry, fees
-        desired_total = target_qty * fraction
-        q = max(0.0, desired_total - qty)
-        if q <= 0:
-            return False
-        fill = slip(px, side, costs.slippage_bps)
-        f = commission(fill*q, costs.fee_bps)
-        cash -= f
-        fees += f
-        avg_entry = (avg_entry*qty + fill*q) / (qty+q)
-        qty += q
-        events.append({
-            "time":ts, "event":tag, "direction":"LONG" if side>0 else "SHORT",
-            "price":fill, "qty":q, "fee":f
-        })
-        return True
-
-    def close_all(ts, px, reason):
-        nonlocal cash, qty, side, avg_entry, stop, fav, target_qty
-        nonlocal add1, add2, campaign_time, cooldown, fees
-        if qty <= 0:
-            return
-        exit_side = -side
-        fill = slip(px, exit_side, costs.slippage_bps)
-        pnl = side * qty * (fill - avg_entry)
-        f = commission(fill*qty, costs.fee_bps)
-        cash += pnl - f
-        fees += f
-        trades.append({
-            "entry_time":campaign_time, "exit_time":ts,
-            "direction":"LONG" if side>0 else "SHORT",
-            "exit_reason":reason, "entry_avg":avg_entry, "exit_price":fill,
-            "qty":qty, "net_pnl":cash-campaign_start,
-            "return_on_start_equity":(cash-campaign_start)/max(campaign_start,1e-12)
-        })
-        events.append({
-            "time":ts, "event":"EXIT_"+reason,
-            "direction":"LONG" if side>0 else "SHORT",
-            "price":fill, "qty":qty, "fee":f
-        })
-        qty=0.0; side=0; avg_entry=0.0; stop=np.nan; fav=np.nan
-        target_qty=0.0; add1=False; add2=False; campaign_time=None
-        cooldown = s.cooldown_bars
-
-    for ts, r in d.iterrows():
-        o,h,l,c,a = map(float, [r.open,r.high,r.low,r.close,r.atr])
+    for ts, r in x.iterrows():
+        o, h, l, c, a = map(float, [r.open, r.high, r.low, r.close, r.atr4h])
         regime = str(r.regime)
         rv = float(r.rv30)
+        shock = bool(r.shock)
 
-        if cooldown > 0:
-            cooldown -= 1
+        # Mark previous close -> current open before any rebalance.
+        if prev_close is not None:
+            equity += qty * (o - prev_close)
 
-        eq_open = mark(o)
+        # Reset day/week locks on the fresh marked-to-market open.
         if ts.date() != current_day:
             current_day = ts.date()
-            day_start = eq_open
+            day_start = equity
             day_lock = False
-        ww = wk(ts)
-        if ww != current_week:
-            current_week = ww
-            week_start = eq_open
+        w = week_key(ts)
+        if w != current_week:
+            current_week = w
+            week_start = equity
             week_lock = False
 
-        peak = max(peak, eq_open)
-        dd_open = eq_open/peak - 1 if peak>0 else -1
-        soft = dd_open <= -rules.soft_dd
+        peak_equity = max(peak_equity, equity)
+        dd_open = equity / peak_equity - 1.0
+        soft_dd = dd_open <= -rules.soft_drawdown
 
-        # Existing position exits on regime invalidation at the current 4H open.
-        if qty > 0:
-            if side > 0 and regime not in ("BULL","SHOCK"):
-                close_all(ts, o, "REGIME")
-            elif side < 0 and regime not in ("BEAR","SHOCK"):
-                close_all(ts, o, "REGIME")
-
-        # Deferred entry from completed 4H signal.
-        if pending != 0:
-            pending_count -= 1
-            if pending_count <= 0:
-                if qty == 0 and cooldown == 0 and not day_lock and not week_lock and not hard_stopped:
-                    if ((pending > 0 and regime=="BULL") or
-                        (pending < 0 and regime=="BEAR")):
-                        open_campaign(ts, pending, o, a, rv, regime, soft)
-                pending = 0
-                pending_count = 0
-
-        # Stop FIRST: conservative same-bar sequencing.
-        if qty > 0:
-            bars_market += 1
-            if side > 0 and l <= stop:
-                px = o if o < stop else stop
-                close_all(ts, px, "STOP")
-            elif side < 0 and h >= stop:
-                px = o if o > stop else stop
-                close_all(ts, px, "STOP")
-
-        # Counter-channel exits use the completed 4H close.
-        if qty > 0:
-            if side > 0 and c < float(r.exit_lo):
-                close_all(ts, c, "CHANNEL")
-            elif side < 0 and c > float(r.exit_hi):
-                close_all(ts, c, "CHANNEL")
-
-        # Winner-only anti-martingale. Stop had priority above.
-        if qty > 0:
-            if side > 0:
-                if not add1 and h >= first_entry + s.add1_atr*entry_atr:
-                    if add_to(ts, 0.75, first_entry+s.add1_atr*entry_atr, "ADD1"):
-                        add1=True
-                        stop=max(stop, first_entry-entry_atr)
-                if add1 and not add2 and h >= first_entry + s.add2_atr*entry_atr:
-                    if add_to(ts, 1.00, first_entry+s.add2_atr*entry_atr, "ADD2"):
-                        add2=True
-                        stop=max(stop, avg_entry)
+        # Apply a tactical state change that was generated by a COMPLETED prior 4H bar.
+        if pending_tactical is not None:
+            action, pside, remaining = pending_tactical
+            remaining -= 1
+            if remaining <= 0:
+                if action == "ENTER":
+                    tactical_side = pside
+                    tactical_peak = o
+                else:
+                    tactical_side = 0
+                    tactical_peak = np.nan
+                pending_tactical = None
             else:
-                if not add1 and l <= first_entry - s.add1_atr*entry_atr:
-                    if add_to(ts, 0.75, first_entry-s.add1_atr*entry_atr, "ADD1"):
-                        add1=True
-                        stop=min(stop, first_entry+entry_atr)
-                if add1 and not add2 and l <= first_entry - s.add2_atr*entry_atr:
-                    if add_to(ts, 1.00, first_entry-s.add2_atr*entry_atr, "ADD2"):
-                        add2=True
-                        stop=min(stop, avg_entry)
+                pending_tactical = (action, pside, remaining)
 
-        # Trailing stop becomes active for NEXT 4H bar.
-        if qty > 0:
-            trail_mult = min(s.trail_atr, 3.0) if regime=="SHOCK" else s.trail_atr
-            if side > 0:
-                fav=max(fav,h)
-                stop=max(stop, fav-trail_mult*a)
-            else:
-                fav=min(fav,l)
-                stop=min(stop, fav+trail_mult*a)
+        if not shorts_enabled and tactical_side < 0:
+            tactical_side = 0
+            tactical_peak = np.nan
 
-        eq = mark(c)
-        peak = max(peak, eq)
-        dd = eq/peak - 1 if peak>0 else -1
+        # Locks / hard stop override all model exposures.
+        desired = 0.0
+        reason = "MODEL"
+        if hard_stopped or day_lock or week_lock:
+            desired = 0.0
+            reason = "LOCK"
+        else:
+            desired = target_exposure(regime, rv, shock,
+                                      tactical_side if tactical_enabled else 0,
+                                      s, soft_dd)
+            if not shorts_enabled:
+                desired = max(0.0, desired)
 
-        # Portfolio locks.
-        if day_start>0 and eq/day_start-1 <= -rules.daily_loss_lock:
-            day_lock=True
-            if qty>0:
-                close_all(ts,c,"DAILY_LOCK")
-                eq=cash
-        if week_start>0 and eq/week_start-1 <= -rules.weekly_loss_lock:
-            week_lock=True
-            if qty>0:
-                close_all(ts,c,"WEEKLY_LOCK")
-                eq=cash
-        if dd <= -rules.hard_dd:
-            if qty>0:
-                close_all(ts,c,"HARD_DD")
-                eq=cash
-            hard_stopped=True
+        # Rebalance whenever exposure target materially changes or daily regime changes.
+        if (abs(desired - last_exposure) >= 0.025 or regime != last_regime or
+                (desired == 0 and abs(last_exposure) > 1e-12)):
+            set_position(ts, o, desired, reason)
+        last_regime = regime
 
-        # Generate new signal from THIS completed 4H candle.
-        # It cannot execute until a future 4H open.
-        if qty==0 and pending==0 and cooldown==0 and not day_lock and not week_lock and not hard_stopped:
+        if abs(qty) > 0:
+            bars_exposed += 1
+
+        # Mark current 4H open -> close. This deliberately avoids using intrabar
+        # highs/lows for portfolio PnL while still allowing them to update a future
+        # tactical trailing reference.
+        equity += qty * (c - o)
+        peak_equity = max(peak_equity, equity)
+        dd = equity / peak_equity - 1.0
+
+        # Risk locks are evaluated after the completed 4H candle and flatten on
+        # the next bar open, avoiding same-bar hindsight fills.
+        if day_start > 0 and equity / day_start - 1 <= -rules.daily_loss_lock:
+            day_lock = True
+        if week_start > 0 and equity / week_start - 1 <= -rules.weekly_loss_lock:
+            week_lock = True
+        if dd <= -rules.hard_drawdown:
+            hard_stopped = True
+
+        # Generate tactical transition for a FUTURE 4H open.
+        if tactical_enabled and not hard_stopped:
             buf = s.breakout_buffer_atr * a
-            if regime=="BULL" and c > float(r.entry_hi)+buf:
-                pending=+1
-                pending_count=max(1,entry_delay_bars)
-            elif regime=="BEAR" and c < float(r.entry_lo)-buf:
-                pending=-1
-                pending_count=max(1,entry_delay_bars)
+            if tactical_side == 0 and pending_tactical is None:
+                if regime in ("BULL_STRONG", "BULL_WEAK") and c > float(r.entry_hi) + buf:
+                    pending_tactical = ("ENTER", +1, max(1, signal_delay_bars))
+                elif shorts_enabled and regime == "BEAR_STRONG" and c < float(r.entry_lo) - buf:
+                    pending_tactical = ("ENTER", -1, max(1, signal_delay_bars))
+            elif tactical_side > 0:
+                tactical_peak = max(tactical_peak, h) if np.isfinite(tactical_peak) else h
+                trail = tactical_peak - s.trail_atr_4h * a
+                if (regime not in ("BULL_STRONG", "BULL_WEAK") or
+                        c < float(r.exit_lo) or c < trail):
+                    if pending_tactical is None:
+                        pending_tactical = ("EXIT", +1, max(1, signal_delay_bars))
+            elif tactical_side < 0:
+                tactical_peak = min(tactical_peak, l) if np.isfinite(tactical_peak) else l
+                trail = tactical_peak + s.trail_atr_4h * a
+                if regime != "BEAR_STRONG" or c > float(r.exit_hi) or c > trail:
+                    if pending_tactical is None:
+                        pending_tactical = ("EXIT", -1, max(1, signal_delay_bars))
 
-        equity.append({
-            "time":ts, "equity":eq, "cash":cash, "qty":qty,
-            "direction":side, "regime":regime, "drawdown":dd,
-            "stop":stop if qty>0 else np.nan
+        rows.append({
+            "time":ts, "equity":equity, "qty":qty,
+            "target_exposure":last_exposure, "regime":regime,
+            "tactical_side":tactical_side, "drawdown":dd,
+            "day_lock":day_lock, "week_lock":week_lock,
+        })
+        prev_close = c
+
+    eqdf = pd.DataFrame(rows).set_index("time")
+    # Flat-at-end accounting cost, so reported final equity is realizable.
+    if abs(qty) > 0 and not eqdf.empty:
+        px = float(x.iloc[-1].close)
+        cost = trade_cost(qty * px, costs)
+        equity -= cost
+        total_costs += cost
+        eqdf.iloc[-1, eqdf.columns.get_loc("equity")] = equity
+        eqdf.iloc[-1, eqdf.columns.get_loc("qty")] = 0.0
+        eqdf.iloc[-1, eqdf.columns.get_loc("target_exposure")] = 0.0
+
+    # Create exposure-regime "campaigns" from contiguous non-zero exposure periods.
+    e = eqdf.copy()
+    active = e.target_exposure.abs() > 1e-9
+    starts = active & ~active.shift(1, fill_value=False)
+    ends = active & ~active.shift(-1, fill_value=False)
+    start_times = list(e.index[starts])
+    end_times = list(e.index[ends])
+    for st, en in zip(start_times, end_times):
+        g = e.loc[st:en]
+        p0 = float(g.equity.iloc[0]); p1 = float(g.equity.iloc[-1])
+        avgexp = float(g.target_exposure.mean())
+        trades.append({
+            "entry_time":st, "exit_time":en,
+            "direction":"LONG" if avgexp > 0 else "SHORT",
+            "avg_exposure":avgexp,
+            "return":p1/p0 - 1 if p0 > 0 else np.nan,
         })
 
-    if qty>0:
-        close_all(d.index[-1], float(d.iloc[-1].close), "END")
-        if equity:
-            equity[-1]["equity"]=cash
-            equity[-1]["cash"]=cash
-            equity[-1]["qty"]=0.0
-            equity[-1]["direction"]=0
-
-    eqdf=pd.DataFrame(equity).set_index("time")
-    trdf=pd.DataFrame(trades)
-    evdf=pd.DataFrame(events)
-    return eqdf,trdf,evdf,{
-        "fees":fees, "hard_stopped":hard_stopped,
-        "bars_market":bars_market, "bars_total":len(d)
+    trdf = pd.DataFrame(trades)
+    evdf = pd.DataFrame(events)
+    extra = {
+        "costs":total_costs, "hard_stopped":hard_stopped,
+        "bars_exposed":bars_exposed, "bars_total":len(eqdf),
+        "rebalances":rebalance_count,
     }
+    return eqdf, trdf, evdf, extra
+
 
 def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float):
-    final=float(eq.equity.iloc[-1])
-    days=max((eq.index[-1]-eq.index[0]).total_seconds()/86400,1)
-    years=days/365.2425
-    cagr=(final/initial)**(1/years)-1 if final>0 else -1
-    dd=eq.equity/eq.equity.cummax()-1
-    daily=eq.equity.resample("1D").last().dropna().pct_change().dropna()
-    std=daily.std()
-    sharpe=float(np.sqrt(365)*daily.mean()/std) if std and std>0 else np.nan
-    downside=daily[daily<0].std()
-    sortino=float(np.sqrt(365)*daily.mean()/downside) if downside and downside>0 else np.nan
-    mdd=float(dd.min())
-    calmar=cagr/abs(mdd) if mdd<0 else np.nan
-    if trades.empty:
-        pf=np.nan; win=np.nan; n=0; longs=shorts=0
-    else:
-        gp=trades.loc[trades.net_pnl>0,"net_pnl"].sum()
-        gl=-trades.loc[trades.net_pnl<0,"net_pnl"].sum()
-        pf=float(gp/gl) if gl>0 else np.inf
-        win=float((trades.net_pnl>0).mean())
-        n=len(trades)
-        longs=int((trades.direction=="LONG").sum())
-        shorts=int((trades.direction=="SHORT").sum())
+    if eq.empty:
+        return {}
+    final = float(eq.equity.iloc[-1])
+    days = max((eq.index[-1] - eq.index[0]).total_seconds()/86400, 1)
+    years = days / 365.2425
+    cagr = (final/initial)**(1/years)-1 if final > 0 else -1.0
+    dd = eq.equity/eq.equity.cummax()-1
+    mdd = float(dd.min())
+    daily = eq.equity.resample("1D").last().dropna().pct_change().dropna()
+    std = daily.std()
+    sharpe = float(np.sqrt(365)*daily.mean()/std) if std and std > 0 else np.nan
+    downside = daily[daily < 0].std()
+    sortino = float(np.sqrt(365)*daily.mean()/downside) if downside and downside > 0 else np.nan
+    calmar = cagr/abs(mdd) if mdd < 0 else np.nan
+    # For continuous-exposure portfolios PF is computed from daily PnL, not campaign PnL.
+    dpnl = eq.equity.resample("1D").last().dropna().diff().dropna()
+    gp = float(dpnl[dpnl > 0].sum())
+    gl = float(-dpnl[dpnl < 0].sum())
+    pf = gp/gl if gl > 0 else np.inf
     return {
         "start":str(eq.index[0]), "end":str(eq.index[-1]),
         "initial_usd":initial, "final_usd":final,
         "total_return":final/initial-1, "cagr":cagr,
         "max_drawdown":mdd, "sharpe_365":sharpe,
         "sortino_365":sortino, "calmar":calmar,
-        "profit_factor":pf, "win_rate":win,
-        "campaigns":n, "long_campaigns":longs, "short_campaigns":shorts,
-        "fees_paid_usd":extra["fees"],
-        "market_exposure":extra["bars_market"]/max(extra["bars_total"],1),
-        "hard_stopped":extra["hard_stopped"],
+        "profit_factor_daily":pf,
+        "campaigns":int(len(trades)),
+        "rebalances":int(extra["rebalances"]),
+        "costs_paid_usd":float(extra["costs"]),
+        "market_exposure":extra["bars_exposed"]/max(extra["bars_total"],1),
+        "hard_stopped":bool(extra["hard_stopped"]),
     }
+
 
 def objective(m):
     if not m or m.get("hard_stopped"):
         return -1e9
-    if m.get("campaigns",0)<8:
-        return -1e6
-    sh=m.get("sharpe_365",0)
-    pf=m.get("profit_factor",0)
-    if not np.isfinite(sh): sh=-1
-    if not np.isfinite(pf): pf=5
-    # Penalize DD and reward OOS-sensible risk adjusted performance.
-    return m["cagr"] - 1.2*abs(m["max_drawdown"]) + 0.08*sh + 0.02*min(pf,5)
+    sh = m.get("sharpe_365", -1)
+    if not np.isfinite(sh):
+        sh = -1
+    # V5 intentionally prioritizes CAGR while keeping a strong DD penalty.
+    return m["cagr"] - 1.10*abs(m["max_drawdown"]) + 0.06*sh
 
-def run_all(data,costs,rules,initial,delay=1):
-    rows=[]; out={}
+
+def run_candidates(data, costs, rules, initial, delay=1):
+    rows=[]; outputs={}
     for s in CANDIDATES:
-        print(f"[TEST] {s.name}",flush=True)
-        eq,tr,ev,ex=backtest(data,s,costs,rules,initial,delay)
+        print(f"[TEST] {s.name}", flush=True)
+        eq,tr,ev,ex = backtest(data,s,costs,rules,initial,delay)
         m=metrics(eq,tr,ex,initial)
-        rows.append({"strategy":s.name,**m,"score":objective(m)})
-        out[s.name]=(eq,tr,ev,m)
-    return pd.DataFrame(rows).sort_values("score",ascending=False),out
+        rows.append({"strategy":s.name, **m, "score":objective(m)})
+        outputs[s.name]=(eq,tr,ev,m)
+    return pd.DataFrame(rows).sort_values("score",ascending=False), outputs
 
-def walk_forward(data,costs,rules,initial):
-    # Slower V4 requires more training history: 3y train -> 1y OOS.
-    start=data.index.min().normalize()
-    end=data.index.max().normalize()
-    rows=[]
-    anchor=start
-    while anchor+pd.DateOffset(years=4) <= end+pd.Timedelta(days=1):
+
+def walk_forward(data, costs, rules, initial):
+    # 3-year train, 1-year OOS, rolled yearly.
+    start=data.index.min().normalize(); end=data.index.max().normalize()
+    rows=[]; anchor=start
+    while anchor + pd.DateOffset(years=4) <= end + pd.Timedelta(days=1):
         train_end=anchor+pd.DateOffset(years=3)-pd.Timedelta(hours=1)
         test_start=train_end+pd.Timedelta(hours=1)
         test_end=anchor+pd.DateOffset(years=4)-pd.Timedelta(hours=1)
         train=data.loc[(data.index>=anchor)&(data.index<=train_end)]
         test=data.loc[(data.index>=test_start)&(data.index<=test_end)]
         if len(train)<15000 or len(test)<4000:
-            anchor+=pd.DateOffset(years=1); continue
+            anchor += pd.DateOffset(years=1); continue
         scored=[]
         for s in CANDIDATES:
             eq,tr,ev,ex=backtest(train,s,costs,rules,initial)
             m=metrics(eq,tr,ex,initial)
             scored.append((objective(m),s,m))
-        scored.sort(key=lambda x:x[0],reverse=True)
-        _,chosen,tm=scored[0]
+        scored.sort(key=lambda z:z[0], reverse=True)
+        _, chosen, tm = scored[0]
         eq,tr,ev,ex=backtest(test,chosen,costs,rules,initial)
         om=metrics(eq,tr,ex,initial)
         rows.append({
@@ -659,41 +606,35 @@ def walk_forward(data,costs,rules,initial):
             "train_cagr":tm["cagr"],"train_mdd":tm["max_drawdown"],
             "test_return":om["total_return"],"test_cagr":om["cagr"],
             "test_mdd":om["max_drawdown"],"test_sharpe":om["sharpe_365"],
-            "test_pf":om["profit_factor"],"test_trades":om["campaigns"],
-            "test_hard_stopped":om["hard_stopped"]
+            "test_pf_daily":om["profit_factor_daily"],
+            "test_rebalances":om["rebalances"],
+            "test_hard_stopped":om["hard_stopped"],
         })
-        anchor+=pd.DateOffset(years=1)
+        anchor += pd.DateOffset(years=1)
     return pd.DataFrame(rows)
 
-def robustness_grid(data,best:Strategy,costs,rules,initial):
+
+def robustness_grid(data, best: Strategy, costs, rules, initial):
     rows=[]
-    for lb_mult in (0.8,1.0,1.2):
-        for trail_mult in (0.8,1.0,1.2):
+    for slow_mult in (0.8,1.0,1.2):
+        for breakout_mult in (0.8,1.0,1.2):
             s=replace(
                 best,
-                name=f"{best.name}_LB{lb_mult:.1f}_TR{trail_mult:.1f}",
-                entry_lookback_4h=max(12,int(round(best.entry_lookback_4h*lb_mult))),
-                trail_atr=max(2.0,best.trail_atr*trail_mult)
+                name=f"{best.name}_S{slow_mult:.1f}_B{breakout_mult:.1f}",
+                slow_days=max(best.fast_days+20, int(round(best.slow_days*slow_mult))),
+                breakout_4h=max(12, int(round(best.breakout_4h*breakout_mult))),
             )
             eq,tr,ev,ex=backtest(data,s,costs,rules,initial)
             m=metrics(eq,tr,ex,initial)
             rows.append({
-                "lookback_mult":lb_mult,"trail_mult":trail_mult,
-                "entry_lookback":s.entry_lookback_4h,"trail_atr":s.trail_atr,
+                "slow_mult":slow_mult,"breakout_mult":breakout_mult,
+                "slow_days":s.slow_days,"breakout_4h":s.breakout_4h,
                 "cagr":m["cagr"],"mdd":m["max_drawdown"],
-                "sharpe":m["sharpe_365"],"pf":m["profit_factor"],
-                "campaigns":m["campaigns"],"hard_stopped":m["hard_stopped"]
+                "sharpe":m["sharpe_365"],"pf_daily":m["profit_factor_daily"],
+                "hard_stopped":m["hard_stopped"],
             })
     return pd.DataFrame(rows)
 
-def benchmark_200d(df1h,initial):
-    d=df1h[["close"]].resample("1D",closed="left",label="right").last().dropna()
-    d["sma200"]=d.close.rolling(200).mean()
-    # Signal known at daily close, applied to next day's return via shift.
-    sig=(d.close>d.sma200).astype(float).shift(1).fillna(0)
-    r=d.close.pct_change().fillna(0)
-    eq=initial*(1+sig*r).cumprod()
-    return eq
 
 def yearly(eq):
     rows=[]
@@ -702,31 +643,70 @@ def yearly(eq):
         rows.append({
             "year":int(y),
             "return":float(g.equity.iloc[-1]/g.equity.iloc[0]-1),
-            "within_year_mdd":float((g.equity/g.equity.cummax()-1).min())
+            "within_year_mdd":float((g.equity/g.equity.cummax()-1).min()),
+            "avg_exposure":float(g.target_exposure.abs().mean()),
         })
     return pd.DataFrame(rows)
 
-def pass_fail(m,wf,stress,robust):
-    oos_ret = float((1+wf.test_return).prod()-1) if not wf.empty else np.nan
-    oos_years = len(wf)
-    oos_cagr = (1+oos_ret)**(1/oos_years)-1 if oos_years>0 and 1+oos_ret>0 else np.nan
-    oos_mdd = float(wf.test_mdd.min()) if not wf.empty else np.nan
-    # Aggregate gates intentionally strict.
+
+def benchmark_sma200(df1h, initial):
+    d=df1h[["close"]].resample("1D",closed="left",label="right").last().dropna()
+    d["sma200"]=d.close.rolling(200).mean()
+    # Prior day's completed signal controls next day's return.
+    sig=(d.close>d.sma200).astype(float).shift(1).fillna(0.0)
+    r=d.close.pct_change().fillna(0.0)
+    eq=initial*(1+sig*r).cumprod()
+    dd=eq/eq.cummax()-1
+    days=max((eq.index[-1]-eq.index[0]).days,1)
+    years=days/365.2425
     return {
-        "full_sample_cagr_ge_25pct": bool(m["cagr"]>=0.25),
-        "full_sample_mdd_le_15pct": bool(abs(m["max_drawdown"])<=0.15),
-        "full_sample_sharpe_ge_1_3": bool(m["sharpe_365"]>=1.3),
-        "full_sample_pf_ge_1_4": bool(m["profit_factor"]>=1.4),
-        "oos_compound_cagr": oos_cagr,
-        "oos_max_window_mdd": oos_mdd,
-        "oos_positive_windows_ratio": float((wf.test_return>0).mean()) if not wf.empty else np.nan,
-        "stress_2x_not_hard_stopped": bool(not stress["hard_stopped"]),
-        "robustness_all_not_hard_stopped": bool((~robust.hard_stopped).all()),
-        "robustness_positive_cagr_ratio": float((robust.cagr>0).mean()),
+        "total_return":float(eq.iloc[-1]/initial-1),
+        "cagr":float((eq.iloc[-1]/initial)**(1/years)-1),
+        "max_drawdown":float(dd.min()),
     }
+
+
+def benchmark_buyhold(df1h, initial):
+    px=df1h.close
+    eq=initial*px/px.iloc[0]
+    dd=eq/eq.cummax()-1
+    days=max((px.index[-1]-px.index[0]).days,1)
+    years=days/365.2425
+    return {
+        "total_return":float(eq.iloc[-1]/initial-1),
+        "cagr":float((eq.iloc[-1]/initial)**(1/years)-1),
+        "max_drawdown":float(dd.min()),
+    }
+
+
+def acceptance(best_m, wf, stress_m, delay_m, robust):
+    if not wf.empty:
+        oos_total=float((1+wf.test_return).prod()-1)
+        years=len(wf)
+        oos_cagr=float((1+oos_total)**(1/years)-1) if 1+oos_total>0 else -1.0
+        pos_ratio=float((wf.test_return>0).mean())
+        worst_oos_mdd=float(wf.test_mdd.min())
+    else:
+        oos_cagr=np.nan; pos_ratio=np.nan; worst_oos_mdd=np.nan
+    return {
+        "full_cagr_ge_25pct":bool(best_m["cagr"]>=0.25),
+        "full_mdd_le_15pct":bool(abs(best_m["max_drawdown"])<=0.15),
+        "full_sharpe_ge_1_3":bool(best_m["sharpe_365"]>=1.3),
+        "full_pf_daily_ge_1_4":bool(best_m["profit_factor_daily"]>=1.4),
+        "oos_compound_cagr":oos_cagr,
+        "oos_positive_window_ratio":pos_ratio,
+        "oos_worst_window_mdd":worst_oos_mdd,
+        "stress_2x_positive_cagr":bool(stress_m["cagr"]>0),
+        "stress_2x_not_hard_stopped":bool(not stress_m["hard_stopped"]),
+        "delay_positive_cagr":bool(delay_m["cagr"]>0),
+        "robust_positive_cagr_ratio":float((robust.cagr>0).mean()),
+        "robust_all_survive_hard_stop":bool((~robust.hard_stopped).all()),
+    }
+
 
 def pct(x):
     return "n/a" if x is None or not np.isfinite(x) else f"{100*x:.2f}%"
+
 
 def main():
     ap=argparse.ArgumentParser()
@@ -744,106 +724,107 @@ def main():
     costs=CostModel(args.fee_bps,args.slippage_bps)
     rules=RiskRules()
 
-    cand,outputs=run_all(data,costs,rules,args.initial)
+    cand,outputs=run_candidates(data,costs,rules,args.initial)
     cand.to_csv(out/"candidate_summary.csv",index=False)
     best_name=str(cand.iloc[0].strategy)
     best_s=next(s for s in CANDIDATES if s.name==best_name)
     eq,tr,ev,bm=outputs[best_name]
     eq.to_csv(out/"equity.csv")
-    tr.to_csv(out/"trades.csv",index=False)
+    tr.to_csv(out/"campaigns.csv",index=False)
     ev.to_csv(out/"events.csv",index=False)
     yearly(eq).to_csv(out/"yearly.csv",index=False)
 
     wf=walk_forward(data,costs,rules,args.initial)
     wf.to_csv(out/"walk_forward.csv",index=False)
 
-    # Transaction-cost stress
+    # 2x transaction-cost stress.
     stress_costs=CostModel(args.fee_bps*2,args.slippage_bps*2)
-    stress_rows=[]
-    stress_map={}
+    stress_rows=[]; stress_map={}
     for s in CANDIDATES:
         e,t,v,x=backtest(data,s,stress_costs,rules,args.initial)
         m=metrics(e,t,x,args.initial)
-        stress_rows.append({"strategy":s.name,**m})
-        stress_map[s.name]=m
+        stress_rows.append({"strategy":s.name,**m}); stress_map[s.name]=m
     pd.DataFrame(stress_rows).to_csv(out/"cost_stress_2x.csv",index=False)
 
-    # One extra 4H execution delay
-    delay_rows=[]
+    # One additional 4H bar of signal latency.
+    delay_rows=[]; delay_map={}
     for s in CANDIDATES:
-        e,t,v,x=backtest(data,s,costs,rules,args.initial,entry_delay_bars=2)
+        e,t,v,x=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2)
         m=metrics(e,t,x,args.initial)
-        delay_rows.append({"strategy":s.name,**m})
+        delay_rows.append({"strategy":s.name,**m}); delay_map[s.name]=m
     pd.DataFrame(delay_rows).to_csv(out/"execution_delay_stress.csv",index=False)
+
+    # Core-only and no-short attribution for the selected candidate.
+    ecore,tcore,vcore,xcore=backtest(data,best_s,costs,rules,args.initial,tactical_enabled=False)
+    mcore=metrics(ecore,tcore,xcore,args.initial)
+    enoshort,tnoshort,vnoshort,xnoshort=backtest(data,best_s,costs,rules,args.initial,shorts_enabled=False)
+    mnoshort=metrics(enoshort,tnoshort,xnoshort,args.initial)
+    pd.DataFrame([
+        {"variant":"V5 full",**bm},
+        {"variant":"core only",**mcore},
+        {"variant":"no shorts",**mnoshort},
+    ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
     robust.to_csv(out/"robustness_grid.csv",index=False)
 
-    bh=float(data.close.iloc[-1]/data.close.iloc[0]-1)
-    smaeq=benchmark_200d(data,args.initial)
-    sma_ret=float(smaeq.iloc[-1]/args.initial-1)
+    bh=benchmark_buyhold(data,args.initial)
+    sma=benchmark_sma200(data,args.initial)
+    gates=acceptance(bm,wf,stress_map[best_name],delay_map[best_name],robust)
 
-    gates=pass_fail(bm,wf,stress_map[best_name],robust)
-
-    # KRW projection is simply the strategy return path applied to KRW 10m.
     krw=pd.DataFrame(index=eq.index)
     krw["strategy_equity_krw"]=10_000_000*(eq.equity/args.initial)
     krw.to_csv(out/"krw_10m_projection.csv")
 
     summary={
-        "version":"V4 Macro Trend",
+        "version":"V5 Core + Tactical",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
-        "one_hour_rows":len(data),
-        "best_full_sample":best_name,
-        "best_metrics":bm,
-        "buy_hold_total_return":bh,
-        "sma200_long_cash_total_return":sma_ret,
-        "gates":gates,
+        "rows_1h":len(data),"best_full_sample":best_name,
+        "best_metrics":bm,"core_only_metrics":mcore,"no_short_metrics":mnoshort,
+        "buy_hold":bh,"sma200_long_cash":sma,"acceptance":gates,
         "assumptions":{
-            "price_source":"Binance BTCUSDT spot 1h price proxy",
+            "price_source":"Binance BTCUSDT spot 1H price proxy",
+            "fee_bps_per_rebalance":costs.fee_bps,
+            "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
-            "fee_bps_per_fill":costs.fee_bps,
-            "slippage_bps_per_fill":costs.slippage_bps,
-            "signal_execution":"completed 4H signal -> next 4H open",
-            "martingale":False,
-            "averaging_down":False,
-            "simultaneous_long_short":False,
+            "signal_timing":"completed daily/4H data -> later 4H open",
+            "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V4 — Backtest Report","",
+        "# BTC AI EA V5 — Core + Tactical Backtest Report","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Best full-sample candidate: **{best_name}**",
         f"- CAGR: **{pct(bm['cagr'])}**",
+        f"- Total return: **{pct(bm['total_return'])}**",
         f"- Max drawdown: **{pct(bm['max_drawdown'])}**",
         f"- Sharpe: **{bm['sharpe_365']:.2f}**",
-        f"- Profit factor: **{bm['profit_factor']:.2f}**",
-        f"- Campaigns: **{bm['campaigns']}** (Long {bm['long_campaigns']} / Short {bm['short_campaigns']})",
-        f"- Fees paid: **${bm['fees_paid_usd']:.2f}**",
-        f"- Buy & hold total return: **{pct(bh)}**",
-        f"- Simple 200D long/cash total return: **{pct(sma_ret)}**",
-        "",
-        "## Candidate comparison","",
-        cand.to_markdown(index=False),
-        "",
-        "## Walk-forward OOS","",
-        wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
-        "",
-        "## Acceptance gates","",
-        "```json",json.dumps(gates,indent=2,default=str),"```",
-        "",
-        "## Decision rule","",
-        "Do NOT deploy live merely because full-sample performance is attractive. "
-        "A viable model must survive OOS, 2x transaction costs, one-bar delay, "
-        "nearby-parameter robustness, then perpetual-futures/funding validation "
-        "and at least four weeks of paper trading."
+        f"- Daily profit factor: **{bm['profit_factor_daily']:.2f}**",
+        f"- Rebalances: **{bm['rebalances']}**",
+        f"- Costs: **${bm['costs_paid_usd']:.2f}**",
+        f"- Core-only CAGR: **{pct(mcore['cagr'])}**",
+        f"- No-short CAGR: **{pct(mnoshort['cagr'])}**",
+        f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
+        f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
+        "","## Candidate comparison","",cand.to_markdown(index=False),
+        "","## Walk-forward OOS","",wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
+        "","## Attribution","",
+        pd.DataFrame([
+            {"variant":"V5 full",**bm},
+            {"variant":"core only",**mcore},
+            {"variant":"no shorts",**mnoshort},
+        ]).to_markdown(index=False),
+        "","## Acceptance gates","","```json",json.dumps(gates,indent=2,default=str),"```",
+        "","## Decision rule","",
+        "V5 is not live-ready unless OOS, 2x-cost, latency and nearby-parameter tests remain acceptable. "
+        "Even a strong backtest must still pass perpetual-futures/funding validation and paper trading."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-
-    print("\n=== V4 COMPLETE ===")
+    print("\n=== V5 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
