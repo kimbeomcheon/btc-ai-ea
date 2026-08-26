@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V6 Dynamic Risk Overlay Backtester
+BTC AI EA — V7 Proactive Market-Risk Backtester
 ==============================================
 
-Why V6 exists
+Why V7 exists
 -------------
-V5.1 finally produced a meaningful return engine, but its ~31% maximum drawdown
-and weak walk-forward persistence were unacceptable. V6 keeps the proven
-Core + Tactical long architecture and changes the RISK LAYER rather than chasing
-a new entry signal.
+V5.1 produced the strongest return engine so far, while V6 showed that cutting
+risk only after account drawdown is already visible sacrifices too much upside.
+V7 therefore removes the progressive account-drawdown throttle and moves the
+defence upstream into completed DAILY market data.
 
 Architecture
 ------------
-1) CORE: slow daily BTC bull-trend exposure.
+1) CORE: slow daily BTC bull-trend exposure inherited from V5.1.
 2) TACTICAL: 4H breakout sleeve, long only.
-3) MARKET RISK OVERLAY: 20/50-day trend damage, 5/20-day downside momentum,
-   realized-volatility expansion, and shock detection.
-4) ACCOUNT DD OVERLAY: exposure is progressively reduced as strategy equity
-   falls from its high-water mark.
-5) CIRCUIT BREAKERS: daily/weekly loss locks plus a 15% terminal research gate.
+3) PROACTIVE MARKET RISK: 20/50/200-day trend damage, 5/20-day downside
+   momentum, drawdown from the 20-day high, realized-volatility expansion,
+   and shock detection.
+4) HYSTERESIS: risk escalates immediately but exposure is restored only after
+   several completed daily bars confirm recovery.
+5) CIRCUIT BREAKERS: daily/weekly loss locks and a separate 15% terminal
+   research gate. The 15% gate does not drive normal position sizing.
 
 Risk states
 -----------
 NORMAL -> CAUTION -> DEFENSIVE -> PANIC
 
-The overlay is designed to reduce exposure before a 15% account drawdown is hit,
-then allow measured recovery when market conditions normalize. It does NOT reset
-the historical equity high-water mark and therefore cannot cosmetically erase
-drawdown.
+The design objective is to preserve V5.1-like bull participation while reducing
+exposure BEFORE large strategy drawdowns emerge. No account high-water-mark
+throttle is used in the ordinary shadow run.
 
 Anti-lookahead rules
 --------------------
@@ -83,62 +84,65 @@ class Strategy:
     max_long: float
     risk_fast_days: int
     risk_mid_days: int
+    risk_slow_days: int
     mom5_cut: float
     mom20_cut: float
+    high20_cut: float
     rv_ratio_cut: float
     caution_scale: float
     defense_scale: float
     panic_scale: float
+    recovery_days: int
 
 
 CANDIDATES = [
-    # Direct descendant of V5.1C90L with the new V6 risk overlay.
+    # Closest to V5.1C90L: full bull participation, moderate proactive cuts.
     Strategy(
-        "V6A_BALANCED",
+        "V7A_BALANCED",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.72, weak_long=0.36, tactical_long=0.27,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
         max_long=0.99,
-        risk_fast_days=20, risk_mid_days=50,
-        mom5_cut=-0.10, mom20_cut=-0.17, rv_ratio_cut=1.45,
-        caution_scale=0.72, defense_scale=0.40, panic_scale=0.12,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.105, mom20_cut=-0.18, high20_cut=-0.16, rv_ratio_cut=1.50,
+        caution_scale=0.70, defense_scale=0.35, panic_scale=0.00, recovery_days=3,
     ),
-    # More upside participation, but the same pre-emptive risk controls.
+    # Slightly more permissive to protect CAGR.
     Strategy(
-        "V6B_GROWTH",
+        "V7B_GROWTH",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.82, weak_long=0.40, tactical_long=0.28,
-        breakout_4h=40, exit_4h=20, trail_atr_4h=4.8,
-        breakout_buffer_atr=0.08, vol_target=0.60, vol_floor_scale=0.58,
-        max_long=1.10,
-        risk_fast_days=20, risk_mid_days=50,
-        mom5_cut=-0.11, mom20_cut=-0.18, rv_ratio_cut=1.50,
-        caution_scale=0.75, defense_scale=0.43, panic_scale=0.14,
+        strong_long=0.76, weak_long=0.38, tactical_long=0.28,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.7,
+        breakout_buffer_atr=0.08, vol_target=0.58, vol_floor_scale=0.56,
+        max_long=1.04,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.115, mom20_cut=-0.19, high20_cut=-0.17, rv_ratio_cut=1.55,
+        caution_scale=0.76, defense_scale=0.42, panic_scale=0.04, recovery_days=2,
     ),
-    # Explicitly drawdown-first.
+    # Faster and harder de-risking.
     Strategy(
-        "V6C_DEFENSIVE",
+        "V7C_DEFENSIVE",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.64, weak_long=0.30, tactical_long=0.20,
-        breakout_4h=45, exit_4h=18, trail_atr_4h=4.2,
-        breakout_buffer_atr=0.10, vol_target=0.50, vol_floor_scale=0.50,
-        max_long=0.84,
-        risk_fast_days=15, risk_mid_days=45,
-        mom5_cut=-0.08, mom20_cut=-0.14, rv_ratio_cut=1.35,
-        caution_scale=0.65, defense_scale=0.32, panic_scale=0.06,
+        strong_long=0.70, weak_long=0.34, tactical_long=0.24,
+        breakout_4h=42, exit_4h=18, trail_atr_4h=4.3,
+        breakout_buffer_atr=0.09, vol_target=0.53, vol_floor_scale=0.52,
+        max_long=0.94,
+        risk_fast_days=15, risk_mid_days=45, risk_slow_days=180,
+        mom5_cut=-0.085, mom20_cut=-0.15, high20_cut=-0.13, rv_ratio_cut=1.38,
+        caution_scale=0.62, defense_scale=0.26, panic_scale=0.00, recovery_days=3,
     ),
-    # Slightly faster market-risk response without lowering normal bull exposure.
+    # Tests whether slower recovery, rather than harder exits, improves whipsaw.
     Strategy(
-        "V6D_FAST_RISK",
+        "V7D_STICKY",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.72, weak_long=0.36, tactical_long=0.25,
-        breakout_4h=35, exit_4h=18, trail_atr_4h=4.2,
+        strong_long=0.72, weak_long=0.36, tactical_long=0.26,
+        breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.97,
-        risk_fast_days=15, risk_mid_days=40,
-        mom5_cut=-0.09, mom20_cut=-0.15, rv_ratio_cut=1.40,
-        caution_scale=0.68, defense_scale=0.36, panic_scale=0.08,
+        max_long=0.98,
+        risk_fast_days=20, risk_mid_days=50, risk_slow_days=200,
+        mom5_cut=-0.10, mom20_cut=-0.17, high20_cut=-0.15, rv_ratio_cut=1.45,
+        caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
 ]
 
@@ -158,7 +162,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v6/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v7/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -307,16 +311,21 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
     d.loc[weak_bull, "regime"] = "BULL_WEAK"
     d.loc[strong_bull, "regime"] = "BULL_STRONG"
 
-    # Faster V6 risk sensors.
+    # Faster V7 proactive risk sensors.
     d["risk_fast"] = d["close"].ewm(
         span=s.risk_fast_days, adjust=False, min_periods=s.risk_fast_days
     ).mean()
     d["risk_mid"] = d["close"].ewm(
         span=s.risk_mid_days, adjust=False, min_periods=s.risk_mid_days
     ).mean()
+    d["risk_slow"] = d["close"].ewm(
+        span=s.risk_slow_days, adjust=False, min_periods=s.risk_slow_days
+    ).mean()
     ret = d["close"].pct_change()
     d["ret5"] = d["close"].pct_change(5)
     d["ret20"] = d["close"].pct_change(20)
+    d["high20"] = d["close"].shift(1).rolling(20, min_periods=10).max()
+    d["dd20"] = d["close"] / d["high20"] - 1.0
     d["rv30"] = ret.rolling(30, min_periods=20).std() * np.sqrt(365)
     d["rv90_med"] = d["rv30"].rolling(90, min_periods=45).median()
     d["rv_ratio"] = d["rv30"] / d["rv90_med"].replace(0, np.nan)
@@ -327,11 +336,12 @@ def build_features(df1h: pd.DataFrame, s: Strategy) -> pd.DataFrame:
         (ret.abs() > 3.0 * ret.rolling(60, min_periods=30).std())
     ).fillna(False)
     d["dclose"] = d["close"]
+    d["daily_seq"] = np.arange(len(d), dtype=int)
 
     left = h4.reset_index().rename(columns={h4.index.name or "index":"time"})
     right = d[[
         "regime", "rv30", "rv_ratio", "shock", "fast", "slow", "slow_slope",
-        "risk_fast", "risk_mid", "ret5", "ret20", "dclose"
+        "risk_fast", "risk_mid", "risk_slow", "ret5", "ret20", "dd20", "dclose", "daily_seq"
     ]].reset_index()
     right = right.rename(columns={right.columns[0]:"time"})
     x = pd.merge_asof(
@@ -360,16 +370,25 @@ def vol_scale(rv: float, s: Strategy) -> float:
     return float(np.clip(s.vol_target / rv, s.vol_floor_scale, 1.0))
 
 
-def market_risk_state(dclose: float, risk_fast: float, risk_mid: float,
-                      ret5: float, ret20: float, rv_ratio: float,
-                      shock: bool, s: Strategy):
-    """Return state, scale, warning count using only completed daily data."""
+def raw_market_risk_state(dclose: float, risk_fast: float, risk_mid: float,
+                          risk_slow: float, ret5: float, ret20: float,
+                          dd20: float, rv_ratio: float, shock: bool,
+                          s: Strategy):
+    """Immediate market-risk classification from completed daily data only."""
     warnings = 0
+    if np.isfinite(dclose) and np.isfinite(risk_fast) and dclose < risk_fast:
+        warnings += 1
     if np.isfinite(dclose) and np.isfinite(risk_mid) and dclose < risk_mid:
+        warnings += 1
+    if np.isfinite(dclose) and np.isfinite(risk_slow) and dclose < risk_slow:
         warnings += 1
     if np.isfinite(risk_fast) and np.isfinite(risk_mid) and risk_fast < risk_mid:
         warnings += 1
-    if np.isfinite(ret20) and ret20 < -0.08:
+    if np.isfinite(risk_mid) and np.isfinite(risk_slow) and risk_mid < risk_slow:
+        warnings += 1
+    if np.isfinite(ret5) and ret5 < -0.05:
+        warnings += 1
+    if np.isfinite(ret20) and ret20 < -0.10:
         warnings += 1
     if np.isfinite(rv_ratio) and rv_ratio > s.rv_ratio_cut:
         warnings += 1
@@ -377,57 +396,67 @@ def market_risk_state(dclose: float, risk_fast: float, risk_mid: float,
     panic = (
         (np.isfinite(ret5) and ret5 <= s.mom5_cut) or
         (np.isfinite(ret20) and ret20 <= s.mom20_cut) or
-        (shock and np.isfinite(ret5) and ret5 < -0.04)
+        (np.isfinite(dd20) and dd20 <= s.high20_cut and
+         np.isfinite(dclose) and np.isfinite(risk_mid) and dclose < risk_mid) or
+        (shock and np.isfinite(ret5) and ret5 < -0.035)
     )
     if panic:
-        return "PANIC", s.panic_scale, warnings
-    if warnings >= 3:
-        return "DEFENSIVE", s.defense_scale, warnings
+        return "PANIC", warnings
+
+    defensive = (
+        warnings >= 4 or
+        (np.isfinite(dclose) and np.isfinite(risk_mid) and dclose < risk_mid and
+         np.isfinite(ret20) and ret20 < -0.07)
+    )
+    if defensive:
+        return "DEFENSIVE", warnings
     if warnings >= 1:
-        return "CAUTION", s.caution_scale, warnings
-    return "NORMAL", 1.0, warnings
+        return "CAUTION", warnings
+    return "NORMAL", warnings
 
 
-def drawdown_risk_scale(dd: float, market_state: str) -> float:
-    """Progressive account-risk throttle based on true all-time drawdown."""
-    if dd > -0.04:
-        scale = 1.00
-    elif dd > -0.07:
-        scale = 0.82
-    elif dd > -0.10:
-        scale = 0.62
-    elif dd > -0.12:
-        scale = 0.42
-    elif dd > -0.14:
-        scale = 0.22
-    else:
-        scale = 0.08
+STATE_LEVEL = {"NORMAL":0, "CAUTION":1, "DEFENSIVE":2, "PANIC":3}
+LEVEL_STATE = {v:k for k,v in STATE_LEVEL.items()}
 
-    # Recovery floor: when market risk has fully normalized, keep enough
-    # exposure to recover from a drawdown rather than remaining permanently flat.
-    if dd <= -0.10 and market_state == "NORMAL":
-        scale = max(scale, 0.42)
-    return scale
+
+def hysteresis_update(current: str | None, raw: str, recovery_count: int,
+                      recovery_days: int):
+    """Escalate immediately; recover only after consecutive completed days."""
+    if current is None:
+        return raw, 0
+    c = STATE_LEVEL[current]; r = STATE_LEVEL[raw]
+    if r >= c:
+        # Worsening is immediate; equal state clears any stale recovery count.
+        return raw, 0
+    recovery_count += 1
+    if recovery_count < recovery_days:
+        return current, recovery_count
+    # Step down one risk level at a time; this prevents snap-back to full risk.
+    new_level = max(r, c - 1)
+    return LEVEL_STATE[new_level], 0
+
+
+def market_scale_for_state(state: str, s: Strategy) -> float:
+    if state == "CAUTION":
+        return s.caution_scale
+    if state == "DEFENSIVE":
+        return s.defense_scale
+    if state == "PANIC":
+        return s.panic_scale
+    return 1.0
 
 
 def target_exposure(regime: str, rv: float, tactical_side: int, s: Strategy,
-                    dd_open: float, market_state: str, market_scale: float,
-                    market_risk_enabled: bool = True,
-                    dd_risk_enabled: bool = True):
+                    market_state: str, market_risk_enabled: bool = True):
     vscale = vol_scale(rv, s)
     core = core_exposure(regime, s) * vscale
-
     tactical = 0.0
-    # Tactical risk is disabled entirely in defensive/panic states.
     if tactical_side > 0 and regime in ("BULL_STRONG", "BULL_WEAK"):
         if market_state in ("NORMAL", "CAUTION"):
             tactical = s.tactical_long * vscale
-
-    dd_scale = drawdown_risk_scale(dd_open, market_state) if dd_risk_enabled else 1.0
-    mscale = market_scale if market_risk_enabled else 1.0
-    risk_scale = min(mscale, dd_scale)
-    exp = (core + tactical) * risk_scale
-    return float(np.clip(exp, 0.0, s.max_long)), risk_scale, dd_scale, mscale
+    mscale = market_scale_for_state(market_state, s) if market_risk_enabled else 1.0
+    exp = (core + tactical) * mscale
+    return float(np.clip(exp, 0.0, s.max_long)), mscale
 
 
 def trade_cost(delta_notional: float, costs: CostModel) -> float:
@@ -438,9 +467,10 @@ def trade_cost(delta_notional: float, costs: CostModel) -> float:
 def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules,
              initial: float = 10_000.0, signal_delay_bars: int = 1,
              tactical_enabled: bool = True, enforce_hard_stop: bool = True,
-             market_risk_enabled: bool = True, dd_risk_enabled: bool = True):
+             market_risk_enabled: bool = True, hysteresis_enabled: bool = True):
     x = build_features(df1h, s).dropna(
-        subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid", "ret20"]
+        subset=["rv30", "atr4h", "regime", "risk_fast", "risk_mid",
+                "risk_slow", "ret20", "dd20"]
     )
     if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
@@ -465,7 +495,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
     tactical_side = 0
     tactical_peak = np.nan
-    pending_tactical = None  # (action, side, bars_remaining)
+    pending_tactical = None
 
     total_costs = 0.0
     rebalance_count = 0
@@ -476,6 +506,13 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_exposure = 0.0
     last_regime = None
     last_risk_state = None
+
+    # Hysteresis updates only when a NEW completed daily bar becomes available.
+    effective_risk_state = None
+    recovery_count = 0
+    last_daily_seq = None
+    last_raw_state = "NORMAL"
+    last_warning_count = 0
 
     def set_position(ts, px, desired_exp, reason):
         nonlocal equity, qty, total_costs, rebalance_count, last_exposure
@@ -504,32 +541,42 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         dclose = float(r.dclose)
         rfast = float(r.risk_fast)
         rmid = float(r.risk_mid)
+        rslow = float(r.risk_slow)
         ret5 = float(r.ret5) if np.isfinite(r.ret5) else 0.0
         ret20 = float(r.ret20) if np.isfinite(r.ret20) else 0.0
+        dd20 = float(r.dd20) if np.isfinite(r.dd20) else 0.0
+        daily_seq = int(r.daily_seq)
 
-        # Mark previous close -> current open before any rebalance.
         if prev_close is not None:
             equity += qty * (o - prev_close)
 
         if ts.date() != current_day:
-            current_day = ts.date()
-            day_start = equity
-            day_lock = False
+            current_day = ts.date(); day_start = equity; day_lock = False
         w = week_key(ts)
         if w != current_week:
-            current_week = w
-            week_start = equity
-            week_lock = False
+            current_week = w; week_start = equity; week_lock = False
 
         peak_equity = max(peak_equity, equity)
         dd_open = equity / peak_equity - 1.0
 
-        risk_state, market_scale, warning_count = market_risk_state(
-            dclose, rfast, rmid, ret5, ret20, rv_ratio, shock, s
-        )
+        if daily_seq != last_daily_seq:
+            raw_state, warning_count = raw_market_risk_state(
+                dclose, rfast, rmid, rslow, ret5, ret20, dd20, rv_ratio, shock, s
+            )
+            last_raw_state = raw_state
+            last_warning_count = warning_count
+            if hysteresis_enabled:
+                effective_risk_state, recovery_count = hysteresis_update(
+                    effective_risk_state, raw_state, recovery_count, s.recovery_days
+                )
+            else:
+                effective_risk_state = raw_state
+                recovery_count = 0
+            last_daily_seq = daily_seq
 
-        # A completed prior-bar tactical transition is only allowed to enter if
-        # current risk conditions are still acceptable. Exits always execute.
+        risk_state = effective_risk_state or last_raw_state
+        warning_count = last_warning_count
+
         if pending_tactical is not None:
             action, pside, remaining = pending_tactical
             remaining -= 1
@@ -548,19 +595,15 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
         desired = 0.0
         reason = "MODEL"
-        risk_scale = dd_scale = mscale = 0.0
+        mscale = 0.0
         if hard_stopped or day_lock or week_lock:
             reason = "LOCK"
         else:
-            desired, risk_scale, dd_scale, mscale = target_exposure(
+            desired, mscale = target_exposure(
                 regime, rv, tactical_side if tactical_enabled else 0, s,
-                dd_open, risk_state, market_scale,
-                market_risk_enabled=market_risk_enabled,
-                dd_risk_enabled=dd_risk_enabled,
+                risk_state, market_risk_enabled=market_risk_enabled,
             )
 
-        # Rebalance on a material target change, regime transition, or risk-state
-        # transition. 2.5 percentage-point deadband limits transaction-cost churn.
         if (abs(desired - last_exposure) >= 0.025 or
                 regime != last_regime or risk_state != last_risk_state or
                 (desired == 0 and abs(last_exposure) > 1e-12)):
@@ -571,12 +614,10 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         if abs(qty) > 0:
             bars_exposed += 1
 
-        # Current 4H PnL.
         equity += qty * (c - o)
         peak_equity = max(peak_equity, equity)
         dd = equity / peak_equity - 1.0
 
-        # Existing daily/weekly circuit breakers.
         if day_start > 0 and equity / day_start - 1 <= -rules.daily_loss_lock:
             day_lock = True
         if week_start > 0 and equity / week_start - 1 <= -rules.weekly_loss_lock:
@@ -592,7 +633,6 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 hard_stopped = True
         was_below_hard = below_hard
 
-        # Generate a tactical transition for a FUTURE 4H open.
         if tactical_enabled and not hard_stopped:
             buf = s.breakout_buffer_atr * a
             if risk_state in ("DEFENSIVE", "PANIC") and tactical_side > 0:
@@ -614,10 +654,10 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         rows.append({
             "time":ts, "equity":equity, "qty":qty,
             "target_exposure":last_exposure, "regime":regime,
-            "risk_state":risk_state, "risk_warning_count":warning_count,
-            "risk_scale":risk_scale, "market_scale":mscale, "dd_scale":dd_scale,
-            "tactical_side":tactical_side, "drawdown":dd,
-            "day_lock":day_lock, "week_lock":week_lock,
+            "raw_risk_state":last_raw_state, "risk_state":risk_state,
+            "risk_warning_count":warning_count, "market_scale":mscale,
+            "recovery_count":recovery_count, "drawdown":dd,
+            "tactical_side":tactical_side, "day_lock":day_lock, "week_lock":week_lock,
         })
         prev_close = c
 
@@ -631,7 +671,6 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         eqdf.iloc[-1, eqdf.columns.get_loc("qty")] = 0.0
         eqdf.iloc[-1, eqdf.columns.get_loc("target_exposure")] = 0.0
 
-    # Contiguous exposure campaigns.
     active = eqdf.target_exposure.abs() > 1e-9
     starts = active & ~active.shift(1, fill_value=False)
     ends = active & ~active.shift(-1, fill_value=False)
@@ -1017,21 +1056,21 @@ def main():
         tactical_enabled=False,enforce_hard_stop=False
     )
     core_m=metrics(ce,ct,cx,args.initial)
-    me,mt,mv,mx=backtest(
+    be,bt,bv,bx=backtest(
         data,best_s,costs,rules,args.initial,
         enforce_hard_stop=False, market_risk_enabled=False
     )
-    no_market_m=metrics(me,mt,mx,args.initial)
-    de,dt,dv,dx=backtest(
+    base_engine_m=metrics(be,bt,bx,args.initial)
+    re0,rt0,rv0,rx0=backtest(
         data,best_s,costs,rules,args.initial,
-        enforce_hard_stop=False, dd_risk_enabled=False
+        enforce_hard_stop=False, hysteresis_enabled=False
     )
-    no_dd_m=metrics(de,dt,dx,args.initial)
+    raw_overlay_m=metrics(re0,rt0,rx0,args.initial)
     pd.DataFrame([
-        {"variant":"selected full V6 risk overlay",**bsm},
+        {"variant":"selected full V7 proactive + hysteresis",**bsm},
         {"variant":"core only",**core_m},
-        {"variant":"DD overlay only (market overlay disabled)",**no_market_m},
-        {"variant":"market overlay only (DD overlay disabled)",**no_dd_m},
+        {"variant":"base return engine (market overlay disabled)",**base_engine_m},
+        {"variant":"raw proactive overlay (hysteresis disabled)",**raw_overlay_m},
     ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
@@ -1063,7 +1102,7 @@ def main():
     )
 
     summary={
-        "version":"V6 Dynamic Risk Overlay",
+        "version":"V7 Proactive Market Risk",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),
         "selected_candidate":best_name,
@@ -1071,14 +1110,14 @@ def main():
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
         "core_only_shadow_metrics":core_m,
-        "dd_only_shadow_metrics":no_market_m,
-        "market_only_shadow_metrics":no_dd_m,
+        "base_engine_shadow_metrics":base_engine_m,
+        "raw_overlay_shadow_metrics":raw_overlay_m,
         "buy_hold":bh,
         "sma200_long_cash":sma,
         "acceptance":gates,
         "overall_pass":bool(primary_pass),
         "research_note":(
-            "V6 was designed after observing V1-V5.1 results. Its walk-forward "
+            "V7 was designed after observing V1-V6 results. Its walk-forward "
             "windows are useful robustness checks but are NOT pristine untouched "
             "out-of-sample evidence for the overall research program."
         ),
@@ -1088,14 +1127,14 @@ def main():
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "hard_stop_policy":"dynamic pre-emptive scaling plus 15% terminal stop in risk-gated run; non-terminal shadow run for diagnostics",
+            "hard_stop_policy":"proactive market-state scaling plus a separate 15% terminal stop in risk-gated run; no progressive account-DD sizing in shadow run",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V6 — Dynamic Risk Overlay","",
+        "# BTC AI EA V7 — Proactive Market Risk","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
         f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
@@ -1104,8 +1143,8 @@ def main():
         f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
         f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
         f"- Core-only shadow CAGR: **{pct(core_m['cagr'])}**",
-        f"- DD-overlay-only CAGR: **{pct(no_market_m['cagr'])}**",
-        f"- Market-overlay-only CAGR: **{pct(no_dd_m['cagr'])}**",
+        f"- Base-engine CAGR (no market overlay): **{pct(base_engine_m['cagr'])}**",
+        f"- Raw-overlay CAGR (no hysteresis): **{pct(raw_overlay_m['cagr'])}**",
         f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
         f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
         f"- Overall acceptance: **{'PASS' if primary_pass else 'FAIL'}**",
@@ -1126,11 +1165,11 @@ def main():
         summary["research_note"],
         "",
         "## Decision rule","",
-        "Do not deploy live unless V6 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
+        "Do not deploy live unless V7 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V6 COMPLETE ===")
+    print("\n=== V7 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
