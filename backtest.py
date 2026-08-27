@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V11.0.1 V9-Engine / Futures-Execution Backtester
+BTC AI EA — V11.1 OOS-Generalized V9/Futures Backtester
 ==========================================================
 
 Purpose
@@ -77,12 +77,15 @@ class Strategy:
     min_rebalance_bars: int = 1
 
 CANDIDATES = [
-    Strategy("V11A_V9CORE"),
-    Strategy("V11B_CORE95", strong_long=0.2432, weak_long=0.0836,
-             convex_add1=0.1216, convex_add2=0.1292, convex_add3=0.1368),
-    Strategy("V11C_CORE105", strong_long=0.2688, weak_long=0.0924,
-             convex_add1=0.1344, convex_add2=0.1428, convex_add3=0.1512,
-             max_long=0.72),
+    Strategy("V111A_BALANCED", weak_long=0.1056, tactical_min_stage=1,
+             breakout_4h=32, exit_4h=24, recovery_days=4),
+    Strategy("V111B_WIDE_REGIME", strong_long=0.2496, weak_long=0.1144,
+             tactical_long=0.132, breakout_4h=32, exit_4h=24,
+             tactical_min_stage=1, recovery_days=4),
+    Strategy("V111C_PERSIST", strong_long=0.2432, weak_long=0.1100,
+             tactical_long=0.128, breakout_4h=36, exit_4h=28,
+             convex_stepdown_atr=2.40, tactical_min_stage=1,
+             recovery_days=4),
 ]
 
 @dataclass(frozen=True)
@@ -329,7 +332,7 @@ def core_exposure(regime,s):
 def expected_tactical_edge_bps(r,stage,s):
     trend_bonus=0.0
     if r.regime=="BULL_STRONG": trend_bonus=25.0
-    elif r.regime=="BULL_WEAK": trend_bonus=8.0
+    elif r.regime=="BULL_WEAK": trend_bonus=12.0
     breakout=0.0
     if np.isfinite(r.entry_hi) and np.isfinite(r.atr4h) and r.atr4h>0:
         breakout=max(0.0,(r.close-r.entry_hi)/r.atr4h)
@@ -514,7 +517,7 @@ def main():
     ap.add_argument("--start",default="2017-08-17")
     ap.add_argument("--end",default=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
     ap.add_argument("--initial",type=float,default=10000)
-    ap.add_argument("--cache",default=".cache_v11")
+    ap.add_argument("--cache",default=".cache_v111")
     ap.add_argument("--results",default="results")
     a=ap.parse_args()
     outdir=Path(a.results); outdir.mkdir(parents=True,exist_ok=True)
@@ -552,7 +555,7 @@ def main():
                 z["base"]["cagr"])
     selected=max(results,key=key)
     summary={
-        "version":"V11.0.1",
+        "version":"V11.1",
         "architecture":"V9 regime/risk/convex engine on futures/funding execution",
         "selected":selected["candidate"]["name"],
         "development_gate_passed":selected["development_gate"],
@@ -582,4 +585,3 @@ def main():
 
 if __name__=="__main__":
     main()
-
