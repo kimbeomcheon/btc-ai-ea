@@ -1,43 +1,45 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V9.1 Convex Frontier Optimization Backtester
-========================================================
+BTC AI EA — V9.2 Turnover-Controlled Convex Backtester
+======================================================
 
-Why V9.1 exists
+Why V9.2 exists
 ---------------
-V9.0 was the first version to materially move the CAGR/MDD frontier: its selected
-convex model reduced shadow drawdown from the V7.1 linear baseline near 27% to
-about 19%. More importantly, V9.0 robustness found a nearby survivor around
-15.9% CAGR / 14.8% MDD. V9.1 does NOT add a new predictor. It performs a narrow,
-predeclared frontier search around that surviving convex-exposure region.
+V9.1 was the first version whose selected shadow portfolio stayed inside the
+15% drawdown budget, but it still executed 1,189 rebalances and failed the 2x
+transaction-cost stress. V9.2 freezes the V9.1 survivor signal/risk engine and
+changes EXECUTION HYSTERESIS rather than adding another predictor.
 
 Architecture
 ------------
-1) SIGNAL ENGINE: unchanged V7.1D_STICKY daily bull regime + 4H breakout logic.
-2) CONVEX POSITION CONSTRUCTION: small stage-0 exposure, then winner-funded
-   pyramid stages unlocked only after favorable ATR-normalized movement.
-3) DECOUPLED DE-RISK: stage unlock distances and peak-giveback stepdown distance
-   are tuned separately. This lets V9.1 delay adding risk while still cutting
-   earned pyramid exposure quickly when the winner reverses.
-4) TACTICAL SLEEVE: enabled only after a profitable convex stage is reached.
-5) MARKET-RISK OVERLAY: unchanged V7.1 trend/momentum/shock state machine.
-6) CIRCUIT BREAKERS: daily/weekly locks and the separate 15% terminal research
-   gate remain unchanged.
+1) SIGNAL/RISK ENGINE: frozen from V9.1 survivor anchor.
+2) REBALANCE DEADBAND: small volatility-target drift is ignored until the
+   exposure change exceeds a predeclared percentage-point threshold.
+3) PYRAMID CONFIRMATION: stage increases can require persistence for multiple
+   completed 4H bars; stage decreases remain immediate.
+4) RE-ENTRY COOLDOWN: after a profitable pyramid stage is cut, the same risk is
+   not immediately re-added for a short number of completed 4H bars.
+5) URGENT DE-RISK BYPASS: PANIC/DEFENSIVE worsening, locks, regime exits and
+   zero-exposure commands bypass turnover throttles.
+6) NORMAL-STATE RETURN RECOVERY: one candidate tests a modest exposure boost
+   only in NORMAL market-risk state, funded by turnover reduction rather than
+   by leverage expansion across all states.
+7) VALIDATION: full history, 15% terminal gate, walk-forward OOS, 2x costs,
+   +4H execution delay, stress periods and a nearby turnover-control grid.
 
 Research-integrity note
 -----------------------
-V9.1 candidates were designed AFTER observing V9.0 full-sample and robustness
-results, including the T1.2/E0.8 survivor. Therefore V9.1 is development-stage
-parameter research, not pristine untouched OOS evidence. Walk-forward, 2x cost,
-+4H delay and nearby-parameter tests are retained as stability checks.
+V9.2 is development-stage research informed by V9.1 full-sample results. Its
+walk-forward windows are stability checks, not pristine untouched OOS evidence
+for the entire research program.
 
 Anti-lookahead / anti-martingale rules
 --------------------------------------
 - Daily features use only fully completed prior daily candles.
-- 4H signals/stage changes affect exposure only from a later 4H OPEN.
-- Pyramid stages can increase only after favorable price movement from anchor.
-- Exposure is never increased because price fell; no averaging down/martingale.
-- Walk-forward warm-up history is indicator-only; OOS PnL starts fresh.
+- 4H stage decisions use a completed 4H bar and affect only a later 4H open.
+- Stage increases still require favorable ATR-normalized price movement.
+- No averaging down, martingale, simultaneous long/short hedge or fixed high
+  leverage is introduced by turnover control.
 
 Price source
 ------------
@@ -93,6 +95,12 @@ class Strategy:
     convex_trigger3_atr: float
     convex_stepdown_atr: float
     tactical_min_stage: int
+    # V9.2 execution hysteresis / turnover control.
+    rebalance_deadband: float
+    stage_up_confirm_bars: int
+    stage_reentry_cooldown_bars: int
+    normal_boost: float
+    state_change_rebalance: bool
     # Downside fields are retained for feature compatibility but disabled in V9.
     down_sv_warn: float
     down_sv_high: float
@@ -119,7 +127,7 @@ class Strategy:
 
 CANDIDATES = [
     Strategy(
-        "V91A_SURVIVOR_ANCHOR",
+        "V92A_DEADBAND",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
@@ -128,6 +136,8 @@ CANDIDATES = [
         convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
         convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
         convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.040, stage_up_confirm_bars=1,
+        stage_reentry_cooldown_bars=0, normal_boost=1.00, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -136,7 +146,7 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V91B_FAST_DELEVER",
+        "V92B_CONFIRM2",
         fast_days=100, slow_days=250, slope_days=30,
         strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
@@ -144,7 +154,9 @@ CANDIDATES = [
         max_long=0.704,
         convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
         convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
-        convex_stepdown_atr=1.55, tactical_min_stage=2,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.040, stage_up_confirm_bars=2,
+        stage_reentry_cooldown_bars=0, normal_boost=1.00, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -153,15 +165,17 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V91C_MID_FRONTIER",
+        "V92C_COOLDOWN2",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.272, weak_long=0.094, tactical_long=0.150,
+        strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.748,
-        convex_add1=0.136, convex_add2=0.145, convex_add3=0.153,
-        convex_trigger1_atr=1.50, convex_trigger2_atr=3.50, convex_trigger3_atr=6.00,
-        convex_stepdown_atr=1.55, tactical_min_stage=2,
+        max_long=0.704,
+        convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
+        convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.040, stage_up_confirm_bars=1,
+        stage_reentry_cooldown_bars=2, normal_boost=1.00, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -170,15 +184,17 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V91D_RETURN_FRONTIER",
+        "V92D_COMBINED",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.288, weak_long=0.099, tactical_long=0.155,
+        strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.792,
-        convex_add1=0.144, convex_add2=0.153, convex_add3=0.162,
-        convex_trigger1_atr=1.60, convex_trigger2_atr=3.75, convex_trigger3_atr=6.40,
-        convex_stepdown_atr=1.50, tactical_min_stage=2,
+        max_long=0.704,
+        convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
+        convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.040, stage_up_confirm_bars=2,
+        stage_reentry_cooldown_bars=2, normal_boost=1.00, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -187,15 +203,17 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V91E_LATE_PYRAMID",
+        "V92E_STRONG_HYSTERESIS",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.300, weak_long=0.102, tactical_long=0.155,
+        strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.800,
-        convex_add1=0.138, convex_add2=0.148, convex_add3=0.158,
-        convex_trigger1_atr=1.80, convex_trigger2_atr=4.10, convex_trigger3_atr=6.90,
-        convex_stepdown_atr=1.45, tactical_min_stage=2,
+        max_long=0.704,
+        convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
+        convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.050, stage_up_confirm_bars=2,
+        stage_reentry_cooldown_bars=3, normal_boost=1.00, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -204,15 +222,17 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V91F_BASE_WEIGHTED",
+        "V92F_NORMAL_RECOVERY",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.305, weak_long=0.105, tactical_long=0.145,
+        strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.780,
-        convex_add1=0.115, convex_add2=0.125, convex_add3=0.135,
-        convex_trigger1_atr=1.45, convex_trigger2_atr=3.40, convex_trigger3_atr=5.80,
-        convex_stepdown_atr=1.35, tactical_min_stage=2,
+        max_long=0.704,
+        convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
+        convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.040, stage_up_confirm_bars=2,
+        stage_reentry_cooldown_bars=2, normal_boost=1.08, state_change_rebalance=False,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -221,15 +241,17 @@ CANDIDATES = [
         caution_scale=0.68, defense_scale=0.32, panic_scale=0.00, recovery_days=5,
     ),
     Strategy(
-        "V90A_CONTROL",
+        "V91A_CONTROL",
         fast_days=100, slow_days=250, slope_days=30,
-        strong_long=0.320, weak_long=0.110, tactical_long=0.180,
+        strong_long=0.256, weak_long=0.088, tactical_long=0.144,
         breakout_4h=40, exit_4h=20, trail_atr_4h=4.5,
         breakout_buffer_atr=0.08, vol_target=0.55, vol_floor_scale=0.55,
-        max_long=0.880,
-        convex_add1=0.160, convex_add2=0.170, convex_add3=0.180,
-        convex_trigger1_atr=1.20, convex_trigger2_atr=2.80, convex_trigger3_atr=4.80,
-        convex_stepdown_atr=1.80, tactical_min_stage=2,
+        max_long=0.704,
+        convex_add1=0.128, convex_add2=0.136, convex_add3=0.144,
+        convex_trigger1_atr=1.44, convex_trigger2_atr=3.36, convex_trigger3_atr=5.76,
+        convex_stepdown_atr=2.16, tactical_min_stage=2,
+        rebalance_deadband=0.025, stage_up_confirm_bars=1,
+        stage_reentry_cooldown_bars=0, normal_boost=1.00, state_change_rebalance=True,
         down_sv_warn=9.0, down_sv_high=9.0, down_ratio_warn=9.0, down_ratio_high=9.0,
         down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
         down_scale_warn=1.0, down_scale_high=1.0, down_recovery_days=1,
@@ -255,7 +277,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v9.1/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v9.2/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -634,6 +656,8 @@ def target_exposure(regime: str, rv: float, tactical_side: int, s: Strategy,
     mscale = market_scale_for_state(market_state, s) if market_risk_enabled else 1.0
     dscale = downside_scale_for_state(downside_state, s) if downside_filter_enabled else 1.0
     exp = (core + tactical) * mscale * dscale
+    if market_state == "NORMAL":
+        exp *= s.normal_boost
     return float(np.clip(exp, 0.0, s.max_long)), mscale, dscale
 
 
@@ -699,9 +723,16 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     convex_giveback_atr = 0.0
     convex_stage_increases = 0
     convex_stage_decreases = 0
+    stage_up_candidate = 0
+    stage_up_confirm_count = 0
+    stage_reentry_cooldown = 0
+    stage_up_deferred = 0
+    stage_cooldown_blocks = 0
 
     total_costs = 0.0
+    gross_turnover_usd = 0.0
     rebalance_count = 0
+    skipped_rebalances = 0
     bars_exposed = 0
     rows = []
     trades = []
@@ -711,6 +742,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_risk_state = None
     last_downside_state = None
     last_convex_stage = None
+    last_tactical_side = None
 
     # Hysteresis updates only when a NEW completed daily bar becomes available.
     effective_risk_state = None
@@ -723,13 +755,14 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     last_raw_downside_state = "NORMAL"
 
     def set_position(ts, px, desired_exp, reason):
-        nonlocal equity, qty, total_costs, rebalance_count, last_exposure
+        nonlocal equity, qty, total_costs, gross_turnover_usd, rebalance_count, last_exposure
         desired_qty = equity * desired_exp / px if px > 0 else 0.0
         delta = desired_qty - qty
         notional = delta * px
         cost = trade_cost(notional, costs)
         equity -= cost
         total_costs += cost
+        gross_turnover_usd += abs(notional)
         if abs(delta) > 1e-12:
             rebalance_count += 1
             events.append({
@@ -838,16 +871,41 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 convex_enabled=convex_enabled,
             )
 
-        if (abs(desired - last_exposure) >= 0.025 or
+        if s.state_change_rebalance:
+            # Exact V9.1 execution-control baseline. Keep this branch byte-for-byte
+            # equivalent in decision semantics to the prior V9.1 rebalance rule.
+            should_rebalance = (
+                abs(desired - last_exposure) >= s.rebalance_deadband or
                 regime != last_regime or risk_state != last_risk_state or
                 downside_state != last_downside_state or
                 convex_stage != last_convex_stage or
-                (desired == 0 and abs(last_exposure) > 1e-12)):
+                (desired == 0 and abs(last_exposure) > 1e-12)
+            )
+        else:
+            risk_rank = {"NORMAL":0, "CAUTION":1, "DEFENSIVE":2, "PANIC":3}
+            risk_worsened = (
+                last_risk_state is not None and
+                risk_rank.get(risk_state, 0) > risk_rank.get(last_risk_state, 0)
+            )
+            urgent_zero = desired == 0 and abs(last_exposure) > 1e-12
+            stage_changed = last_convex_stage is not None and convex_stage != last_convex_stage
+            tactical_changed = last_tactical_side is not None and tactical_side != last_tactical_side
+            regime_exit = (
+                last_regime in ("BULL_STRONG", "BULL_WEAK") and
+                regime not in ("BULL_STRONG", "BULL_WEAK")
+            )
+            structural = stage_changed or tactical_changed or regime_exit
+            drift_large = abs(desired - last_exposure) >= s.rebalance_deadband
+            should_rebalance = urgent_zero or risk_worsened or structural or drift_large
+        if should_rebalance:
             set_position(ts, o, desired, reason)
+        elif abs(desired - last_exposure) > 1e-12:
+            skipped_rebalances += 1
         last_regime = regime
         last_risk_state = risk_state
         last_downside_state = downside_state
         last_convex_stage = convex_stage
+        last_tactical_side = tactical_side
 
         if abs(qty) > 0:
             bars_exposed += 1
@@ -894,6 +952,8 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
 
         # Convex state update uses this COMPLETED 4H bar. Any resulting
         # exposure change is applied only at the next loop's 4H open.
+        # V9.2 keeps stage decreases immediate, but can require confirmation
+        # and a short cooldown before re-adding a stage that was just cut.
         old_stage = convex_stage
         eligible_convex = (
             convex_enabled and not hard_stopped and
@@ -901,17 +961,23 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             risk_state in ("NORMAL", "CAUTION") and
             not day_lock and not week_lock
         )
+        cooldown_active = stage_reentry_cooldown > 0
         if not eligible_convex:
             convex_stage = 0
             convex_anchor = np.nan
             convex_peak = np.nan
             convex_cushion_atr = 0.0
             convex_giveback_atr = 0.0
+            stage_up_candidate = 0
+            stage_up_confirm_count = 0
+            stage_reentry_cooldown = 0
         else:
             if not np.isfinite(convex_anchor):
                 convex_anchor = c
                 convex_peak = h
                 convex_stage = 0
+                stage_up_candidate = 0
+                stage_up_confirm_count = 0
             else:
                 convex_peak = max(convex_peak, h) if np.isfinite(convex_peak) else h
                 atr_unit = max(a, 1e-12)
@@ -925,7 +991,38 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 if convex_cushion_atr >= s.convex_trigger3_atr:
                     cushion_stage = 3
                 giveback_steps = int(convex_giveback_atr // max(s.convex_stepdown_atr, 1e-9))
-                convex_stage = max(0, cushion_stage - giveback_steps)
+                raw_target_stage = max(0, cushion_stage - giveback_steps)
+
+                if raw_target_stage < convex_stage:
+                    convex_stage = raw_target_stage
+                    stage_reentry_cooldown = max(0, int(s.stage_reentry_cooldown_bars))
+                    stage_up_candidate = 0
+                    stage_up_confirm_count = 0
+                elif raw_target_stage > convex_stage:
+                    if cooldown_active:
+                        stage_cooldown_blocks += 1
+                        stage_up_candidate = 0
+                        stage_up_confirm_count = 0
+                    else:
+                        if stage_up_candidate == raw_target_stage:
+                            stage_up_confirm_count += 1
+                        else:
+                            stage_up_candidate = raw_target_stage
+                            stage_up_confirm_count = 1
+                        if stage_up_confirm_count >= max(1, int(s.stage_up_confirm_bars)):
+                            convex_stage = raw_target_stage
+                            stage_up_candidate = 0
+                            stage_up_confirm_count = 0
+                        else:
+                            stage_up_deferred += 1
+                else:
+                    stage_up_candidate = 0
+                    stage_up_confirm_count = 0
+
+                # Cooldown counts completed 4H observations after the cut.
+                # A newly created cooldown is not decremented on the same bar.
+                if old_stage <= convex_stage and stage_reentry_cooldown > 0:
+                    stage_reentry_cooldown -= 1
 
         if convex_stage != old_stage:
             if convex_stage > old_stage:
@@ -953,6 +1050,8 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             "convex_stage":convex_stage, "convex_anchor":convex_anchor,
             "convex_peak":convex_peak, "convex_cushion_atr":convex_cushion_atr,
             "convex_giveback_atr":convex_giveback_atr,
+            "stage_up_confirm_count":stage_up_confirm_count,
+            "stage_reentry_cooldown":stage_reentry_cooldown,
             "tactical_side":tactical_side, "day_lock":day_lock, "week_lock":week_lock,
         })
         prev_close = c
@@ -982,7 +1081,11 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     trdf = pd.DataFrame(trades)
     evdf = pd.DataFrame(events)
     extra = {
-        "costs":total_costs, "hard_stopped":hard_stopped,
+        "costs":total_costs, "gross_turnover_usd":gross_turnover_usd,
+        "skipped_rebalances":skipped_rebalances,
+        "stage_up_deferred":stage_up_deferred,
+        "stage_cooldown_blocks":stage_cooldown_blocks,
+        "hard_stopped":hard_stopped,
         "hard_breached":hard_breached, "hard_breach_count":hard_breach_count,
         "first_hard_breach_time":(
             str(first_hard_breach_time) if first_hard_breach_time is not None else None
@@ -1025,6 +1128,11 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
         "campaigns":int(len(trades)),
         "rebalances":int(extra["rebalances"]),
         "costs_paid_usd":float(extra["costs"]),
+        "gross_turnover_usd":float(extra.get("gross_turnover_usd", 0.0)),
+        "gross_turnover_x_initial":float(extra.get("gross_turnover_usd", 0.0))/max(initial,1e-12),
+        "skipped_rebalances":int(extra.get("skipped_rebalances", 0)),
+        "stage_up_deferred":int(extra.get("stage_up_deferred", 0)),
+        "stage_cooldown_blocks":int(extra.get("stage_cooldown_blocks", 0)),
         "market_exposure":extra["bars_exposed"]/max(extra["bars_total"],1),
         "hard_stopped":bool(extra["hard_stopped"]),
         "hard_breached":bool(extra.get("hard_breached", extra["hard_stopped"])),
@@ -1036,7 +1144,7 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
 
 
 def objective(m):
-    """V9.1 frontier ranking: maximize return efficiency inside the 15% boundary."""
+    """V9.2 ranking: return efficiency inside 15% MDD; turnover is a tie-break."""
     if not m:
         return -1e9
     sh = m.get("sharpe_365", -1)
@@ -1087,7 +1195,10 @@ def run_candidates(data, costs, rules, initial, delay=1):
             "shadow":(seq,str_,sev,sm),
             "risk":(req,rtr,rev,rm),
         }
-    return pd.DataFrame(rows).sort_values(["mdd_gate","score"],ascending=[False,False]), outputs
+    return pd.DataFrame(rows).sort_values(
+        ["mdd_gate","score","shadow_gross_turnover_x_initial"],
+        ascending=[False,False,True]
+    ), outputs
 
 
 def walk_forward(data, costs, rules, initial):
@@ -1111,9 +1222,12 @@ def walk_forward(data, costs, rules, initial):
         for s in CANDIDATES:
             eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False)
             m=metrics(eq,tr,ex,initial)
-            scored.append((abs(m["max_drawdown"]) <= rules.hard_drawdown, objective(m), s, m))
-        scored.sort(key=lambda z:(z[0], z[1]), reverse=True)
-        _, _, chosen, tm = scored[0]
+            scored.append((
+                abs(m["max_drawdown"]) <= rules.hard_drawdown, objective(m),
+                -m.get("gross_turnover_x_initial", 0.0), s, m
+            ))
+        scored.sort(key=lambda z:(z[0], z[1], z[2]), reverse=True)
+        _, _, _, chosen, tm = scored[0]
 
         seq,str_,sev,sex=backtest(
             test_warm, chosen, costs, rules, initial,
@@ -1150,40 +1264,34 @@ def walk_forward(data, costs, rules, initial):
 
 def robustness_grid(data, best: Strategy, costs, rules, initial):
     rows=[]
-    # V9.1 decouples three nearby perturbations: pyramid unlock timing, exposure,
-    # and giveback stepdown. This tests whether the 15% boundary is a stable
-    # neighborhood rather than a single lucky coordinate.
-    for trigger_mult in (0.9,1.0,1.1):
-        for exp_mult in (0.9,1.0,1.1):
-            for stepdown_mult in (0.8,1.0):
+    # Turnover-specific nearby grid: 3 execution deadbands x 2 confirmation
+    # settings x 3 re-entry cooldowns = 18 combinations. Return/risk signals
+    # and V9.1 exposure staircase remain fixed.
+    for deadband in (0.030,0.040,0.050):
+        for confirm in (1,2):
+            for cooldown in (0,2,4):
                 s=replace(
                     best,
-                    name=f"{best.name}_T{trigger_mult:.1f}_E{exp_mult:.1f}_S{stepdown_mult:.1f}",
-                    convex_trigger1_atr=best.convex_trigger1_atr*trigger_mult,
-                    convex_trigger2_atr=best.convex_trigger2_atr*trigger_mult,
-                    convex_trigger3_atr=best.convex_trigger3_atr*trigger_mult,
-                    convex_stepdown_atr=max(0.75,best.convex_stepdown_atr*stepdown_mult),
-                    strong_long=min(0.60,best.strong_long*exp_mult),
-                    weak_long=min(0.30,best.weak_long*exp_mult),
-                    tactical_long=min(0.30,best.tactical_long*exp_mult),
-                    convex_add1=best.convex_add1*exp_mult,
-                    convex_add2=best.convex_add2*exp_mult,
-                    convex_add3=best.convex_add3*exp_mult,
-                    max_long=min(1.00,best.max_long*exp_mult),
+                    name=f"{best.name}_D{deadband:.3f}_C{confirm}_K{cooldown}",
+                    rebalance_deadband=deadband,
+                    stage_up_confirm_bars=confirm,
+                    stage_reentry_cooldown_bars=cooldown,
                 )
                 seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False)
                 sm=metrics(seq,str_,sex,initial)
                 req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
                 rm=metrics(req,rtr,rex,initial)
                 rows.append({
-                    "trigger_mult":trigger_mult,"exposure_mult":exp_mult,
-                    "stepdown_mult":stepdown_mult,
-                    "trigger1_atr":s.convex_trigger1_atr,"trigger3_atr":s.convex_trigger3_atr,
-                    "stepdown_atr":s.convex_stepdown_atr,
-                    "base_strong":s.strong_long,"max_long":s.max_long,
+                    "rebalance_deadband":deadband,
+                    "stage_up_confirm_bars":confirm,
+                    "stage_reentry_cooldown_bars":cooldown,
+                    "normal_boost":s.normal_boost,
                     "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
                     "shadow_sharpe":sm["sharpe_365"],
                     "shadow_pf_daily":sm["profit_factor_daily"],
+                    "shadow_rebalances":sm["rebalances"],
+                    "shadow_costs_paid_usd":sm["costs_paid_usd"],
+                    "shadow_turnover_x_initial":sm["gross_turnover_x_initial"],
                     "shadow_hard_breached":sm["hard_breached"],
                     "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
                     "risk_hard_stopped":rm["hard_stopped"],
@@ -1318,11 +1426,19 @@ def main():
     cand.to_csv(out/"candidate_summary.csv",index=False)
     pd.DataFrame([s.__dict__ for s in CANDIDATES]).to_csv(out/"candidate_configs.csv",index=False)
     cand.loc[cand["mdd_gate"]].to_csv(out/"mdd15_survivor_candidates.csv",index=False)
+    cand[[
+        "strategy","mdd_gate","shadow_cagr","shadow_max_drawdown",
+        "shadow_rebalances","shadow_costs_paid_usd","shadow_gross_turnover_x_initial",
+        "score"
+    ]].to_csv(out/"turnover_candidate_frontier.csv",index=False)
     best_name=str(cand.iloc[0].strategy)
     best_s=next(s for s in CANDIDATES if s.name==best_name)
 
     seq,str_,sev,bsm=outputs[best_name]["shadow"]
     req,rtr,rev,brm=outputs[best_name]["risk"]
+    control_name="V91A_CONTROL"
+    control_shadow=outputs[control_name]["shadow"][3]
+    control_risk=outputs[control_name]["risk"][3]
 
     seq.to_csv(out/"equity_shadow.csv")
     req.to_csv(out/"equity_risk_gated.csv")
@@ -1371,6 +1487,9 @@ def main():
             "strategy":s.name,
             "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
             "shadow_sharpe":sm["sharpe_365"],"shadow_pf":sm["profit_factor_daily"],
+            "shadow_rebalances":sm["rebalances"],
+            "shadow_costs_paid_usd":sm["costs_paid_usd"],
+            "shadow_turnover_x_initial":sm["gross_turnover_x_initial"],
             "shadow_hard_breached":sm["hard_breached"],
             "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
             "risk_hard_stopped":rm["hard_stopped"],
@@ -1388,6 +1507,9 @@ def main():
             "strategy":s.name,
             "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
             "shadow_sharpe":sm["sharpe_365"],
+            "shadow_rebalances":sm["rebalances"],
+            "shadow_costs_paid_usd":sm["costs_paid_usd"],
+            "shadow_turnover_x_initial":sm["gross_turnover_x_initial"],
             "risk_cagr":rm["cagr"],"risk_mdd":rm["max_drawdown"],
             "risk_hard_stopped":rm["hard_stopped"],
         })
@@ -1417,10 +1539,11 @@ def main():
     )
     linear_m=metrics(le,lt,lx,args.initial)
     pd.DataFrame([
-        {"variant":"selected V9.1 convex frontier",**bsm},
+        {"variant":"selected V9.2 turnover-controlled convex",**bsm},
+        {"variant":"V9.1 survivor control (no new turnover controls)",**control_shadow},
         {"variant":"V7.1D-style linear exposure baseline",**linear_m},
-        {"variant":"V9.1 convex core only (tactical disabled)",**core_m},
-        {"variant":"V9.1 convex, market overlay disabled",**no_market_m},
+        {"variant":"V9.2 convex core only (tactical disabled)",**core_m},
+        {"variant":"V9.2 convex, market overlay disabled",**no_market_m},
     ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
@@ -1452,13 +1575,22 @@ def main():
     )
 
     summary={
-        "version":"V9.1 Convex Frontier Optimization",
+        "version":"V9.2 Turnover-Controlled Convex",
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),
         "selected_candidate":best_name,
-        "selection_method":"V9.0 survivor neighborhood; 15% MDD survivors first, then return-efficient frontier score; unlock and stepdown distances decoupled",
+        "selection_method":"V9.1 survivor engine frozen; 15% MDD survivors first, then return-efficient score with lower turnover as tie-break",
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
+        "v91_control_shadow_metrics":control_shadow,
+        "v91_control_risk_metrics":control_risk,
+        "turnover_change_vs_v91_control":{
+            "rebalance_delta":int(bsm["rebalances"]-control_shadow["rebalances"]),
+            "rebalance_pct":float(bsm["rebalances"]/max(control_shadow["rebalances"],1)-1),
+            "cost_delta_usd":float(bsm["costs_paid_usd"]-control_shadow["costs_paid_usd"]),
+            "cost_pct":float(bsm["costs_paid_usd"]/max(control_shadow["costs_paid_usd"],1e-12)-1),
+            "gross_turnover_x_initial_delta":float(bsm["gross_turnover_x_initial"]-control_shadow["gross_turnover_x_initial"]),
+        },
         "core_only_shadow_metrics":core_m,
         "linear_v71_style_shadow_metrics":linear_m,
         "convex_core_only_shadow_metrics":core_m,
@@ -1468,13 +1600,26 @@ def main():
             "shadow_mdd_le_15pct":bool(abs(bsm["max_drawdown"]) <= 0.15),
             "both":bool(bsm["cagr"] >= 0.20 and abs(bsm["max_drawdown"]) <= 0.15),
         },
+        "turnover_development_target":{
+            "shadow_cagr_ge_15pct":bool(bsm["cagr"] >= 0.15),
+            "shadow_mdd_le_15pct":bool(abs(bsm["max_drawdown"]) <= 0.15),
+            "rebalances_reduced_ge_20pct":bool(bsm["rebalances"] <= 0.80*control_shadow["rebalances"]),
+            "costs_reduced_ge_15pct":bool(bsm["costs_paid_usd"] <= 0.85*control_shadow["costs_paid_usd"]),
+            "stress_2x_risk_not_hard_stopped":bool(not stress_risk_map[best_name]["hard_stopped"]),
+            "all":bool(
+                bsm["cagr"] >= 0.15 and abs(bsm["max_drawdown"]) <= 0.15 and
+                bsm["rebalances"] <= 0.80*control_shadow["rebalances"] and
+                bsm["costs_paid_usd"] <= 0.85*control_shadow["costs_paid_usd"] and
+                not stress_risk_map[best_name]["hard_stopped"]
+            ),
+        },
         "buy_hold":bh,
         "sma200_long_cash":sma,
         "acceptance":gates,
         "overall_pass":bool(primary_pass),
         "research_note":(
-            "V9.1 candidates were designed after observing V9.0 full-sample and robustness results. "
-            "The T1.2/E0.8 survivor directly informed this search. Walk-forward windows are "
+            "V9.2 candidates were designed after observing V9.1 full-sample, turnover and 2x-cost results. "
+            "The V9.1 survivor is included as an exact execution-control baseline. Walk-forward windows are "
             "stability checks, NOT pristine untouched out-of-sample evidence for the research program."
         ),
         "assumptions":{
@@ -1483,15 +1628,16 @@ def main():
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "hard_stop_policy":"V7.1 market-state scaling plus V9.1 convex winner-funded exposure and a separate 15% terminal stop in risk-gated run",
-            "convex_rule":"pyramid stages unlock only after favorable ATR-normalized movement; unlock timing and peak-giveback stepdown are decoupled",
+            "hard_stop_policy":"V7.1 market-state scaling plus V9.1 convex winner-funded exposure, V9.2 execution hysteresis and a separate 15% terminal stop in risk-gated run",
+            "convex_rule":"pyramid stages unlock only after favorable ATR-normalized movement; V9.2 may require stage-up confirmation and re-entry cooldown while de-risk remains immediate",
+            "turnover_rule":"small model drift below rebalance_deadband is deferred; urgent zero/risk worsening/stage reductions bypass throttles",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V9.1 — Convex Frontier Optimization","",
+        "# BTC AI EA V9.2 — Turnover-Controlled Convex","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
         f"- Shadow CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
@@ -1499,11 +1645,16 @@ def main():
         f"- Shadow hard-DD breached: **{bsm['hard_breached']}** ({bsm['hard_breach_count']} crossings)",
         f"- Risk-gated CAGR / MDD: **{pct(brm['cagr'])} / {pct(brm['max_drawdown'])}**",
         f"- Risk-gated hard stop: **{brm['hard_stopped']}**",
+        f"- Rebalances / costs: **{bsm['rebalances']} / ${bsm['costs_paid_usd']:,.2f}**",
+        f"- Gross turnover / initial: **{bsm['gross_turnover_x_initial']:.2f}x**",
+        f"- V9.1 control rebalances / costs: **{control_shadow['rebalances']} / ${control_shadow['costs_paid_usd']:,.2f}**",
         f"- Convex stage increases / decreases: **{bsm.get('convex_stage_increases',0)} / {bsm.get('convex_stage_decreases',0)}**",
+        f"- Stage-up deferred / cooldown blocks: **{bsm.get('stage_up_deferred',0)} / {bsm.get('stage_cooldown_blocks',0)}**",
         f"- V7.1D-style linear baseline CAGR / MDD: **{pct(linear_m['cagr'])} / {pct(linear_m['max_drawdown'])}**",
         f"- Convex core-only CAGR: **{pct(core_m['cagr'])}**",
         f"- Convex no-market-overlay CAGR: **{pct(no_market_m['cagr'])}**",
         f"- Development target (CAGR>=20%, MDD<=15%): **{'PASS' if summary['development_target']['both'] else 'FAIL'}**",
+        f"- Turnover target (CAGR>=15%, MDD<=15%, rebalances -20%, costs -15%, 2x-cost survive): **{'PASS' if summary['turnover_development_target']['all'] else 'FAIL'}**",
         f"- Buy & hold CAGR / MDD: **{pct(bh['cagr'])} / {pct(bh['max_drawdown'])}**",
         f"- 200D long/cash CAGR / MDD: **{pct(sma['cagr'])} / {pct(sma['max_drawdown'])}**",
         f"- Overall acceptance: **{'PASS' if primary_pass else 'FAIL'}**",
@@ -1517,7 +1668,7 @@ def main():
         "## MDD<=15% candidate survivors","",
         cand.loc[cand["mdd_gate"]].to_markdown(index=False) if bool(cand["mdd_gate"].any()) else "No full-sample candidate survived the 15% MDD boundary.",
         "",
-        "## Nearby-parameter robustness","",
+        "## Turnover-control nearby robustness","",
         robust.to_markdown(index=False),
         "",
         "## Acceptance gates","",
@@ -1527,11 +1678,11 @@ def main():
         summary["research_note"],
         "",
         "## Decision rule","",
-        "Do not deploy live unless V9.1 keeps full-sample MDD under 15%, the risk-gated policy survives, OOS windows do not "
+        "Do not deploy live unless V9.2 keeps full-sample MDD under 15%, survives 2x transaction costs and +4H delay, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V9.1 COMPLETE ===")
+    print("\n=== V9.2 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
