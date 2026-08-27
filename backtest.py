@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V11.1 OOS-Generalized V9/Futures Backtester
+BTC AI EA — V11.2 Selective-OOS V9/Futures Backtester
 ==========================================================
 
 Purpose
@@ -77,15 +77,9 @@ class Strategy:
     min_rebalance_bars: int = 1
 
 CANDIDATES = [
-    Strategy("V111A_BALANCED", weak_long=0.1056, tactical_min_stage=1,
-             breakout_4h=32, exit_4h=24, recovery_days=4),
-    Strategy("V111B_WIDE_REGIME", strong_long=0.2496, weak_long=0.1144,
-             tactical_long=0.132, breakout_4h=32, exit_4h=24,
-             tactical_min_stage=1, recovery_days=4),
-    Strategy("V111C_PERSIST", strong_long=0.2432, weak_long=0.1100,
-             tactical_long=0.128, breakout_4h=36, exit_4h=28,
-             convex_stepdown_atr=2.40, tactical_min_stage=1,
-             recovery_days=4),
+    Strategy("V112A_BASELINE"),
+    Strategy("V112B_RECOVERY4", recovery_days=4),
+    Strategy("V112C_WEAK10", weak_long=0.10),
 ]
 
 @dataclass(frozen=True)
@@ -332,7 +326,7 @@ def core_exposure(regime,s):
 def expected_tactical_edge_bps(r,stage,s):
     trend_bonus=0.0
     if r.regime=="BULL_STRONG": trend_bonus=25.0
-    elif r.regime=="BULL_WEAK": trend_bonus=12.0
+    elif r.regime=="BULL_WEAK": trend_bonus=8.0
     breakout=0.0
     if np.isfinite(r.entry_hi) and np.isfinite(r.atr4h) and r.atr4h>0:
         breakout=max(0.0,(r.close-r.entry_hi)/r.atr4h)
@@ -512,12 +506,22 @@ def robustness(x,funding,s,initial):
                     "base_cagr":r["base"]["cagr"],"base_mdd":r["base"]["mdd"]})
     return out
 
+def selective_oos_cagr(result):
+    values=(result["base"]["cagr"],result["oos"]["base"]["cagr"])
+    return min(v if np.isfinite(v) else -np.inf for v in values)
+
+def selection_key(result):
+    sharpe=result["base"]["sharpe"]
+    return (int(result["development_gate"]),result["robustness_pass_rate"],
+            selective_oos_cagr(result),sharpe if np.isfinite(sharpe) else -np.inf,
+            result["base"]["cagr"])
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--start",default="2017-08-17")
     ap.add_argument("--end",default=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
     ap.add_argument("--initial",type=float,default=10000)
-    ap.add_argument("--cache",default=".cache_v111")
+    ap.add_argument("--cache",default=".cache_v112")
     ap.add_argument("--results",default="results")
     a=ap.parse_args()
     outdir=Path(a.results); outdir.mkdir(parents=True,exist_ok=True)
@@ -549,20 +553,16 @@ def main():
         results.append(row)
         r["_curve"].to_csv(outdir/f"{s.name}_equity.csv")
 
-    def key(z):
-        return (int(z["development_gate"]),z["robustness_pass_rate"],
-                z["base"]["sharpe"] if np.isfinite(z["base"]["sharpe"]) else -99,
-                z["base"]["cagr"])
-    selected=max(results,key=key)
+    selected=max(results,key=selection_key)
     summary={
-        "version":"V11.1",
+        "version":"V11.2",
         "architecture":"V9 regime/risk/convex engine on futures/funding execution",
         "selected":selected["candidate"]["name"],
         "development_gate_passed":selected["development_gate"],
         "funding_available":bool(len(funding)),
         "results":results,
     }
-    (outdir/"v11_summary.json").write_text(json.dumps(summary,indent=2,default=float))
+    (outdir/"v112_summary.json").write_text(json.dumps(summary,indent=2,default=float))
     pd.DataFrame([{
         "candidate":z["candidate"]["name"],"gate":z["development_gate"],
         "base_cagr":z["base"]["cagr"],"base_mdd":z["base"]["mdd"],
@@ -570,9 +570,10 @@ def main():
         "adaptive2x_mdd":z["adaptive2x"]["mdd"],"frozen2x_mdd":z["frozen2x"]["mdd"],
         "delay_mdd":z["+4h_delay"]["mdd"],"robustness_pass_rate":z["robustness_pass_rate"],
         "oos_cagr":z["oos"]["base"]["cagr"],"oos_mdd":z["oos"]["base"]["mdd"],
+        "selective_oos_cagr":selective_oos_cagr(z),
         "exposure_time":z["base"]["exposure_time"],"avg_exposure":z["base"]["avg_exposure"],
         "turnover":z["execution"]["base"]["turnover"],"rebalances":z["execution"]["base"]["rebalances"],
-    } for z in results]).to_csv(outdir/"v11_scorecard.csv",index=False)
+    } for z in results]).to_csv(outdir/"v112_scorecard.csv",index=False)
 
     print(json.dumps({
         "selected":summary["selected"],"gate":summary["development_gate_passed"],
