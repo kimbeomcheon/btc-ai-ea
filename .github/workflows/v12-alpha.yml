@@ -46,8 +46,9 @@ jobs:
           import pandas as pd
           scorecard = pd.read_csv("results_v12/v12_alpha_scorecard.csv")
           fields = ["gate", "overfit_fail", "base_cagr", "base_sharpe", "base_mdd",
-                    "oos_cagr", "oos_mdd", "robustness", "turnover", "cost_paid",
-                    "funding_paid", "max_gross"]
+                    "oos_cagr", "oos_mdd", "robustness", "adaptive2x_mdd",
+                    "frozen2x_mdd", "delay_mdd", "hard_stop_any", "turnover",
+                    "cost_paid", "funding_paid", "max_gross"]
           for _, row in scorecard.iterrows():
               details = ", ".join(f"{field}={row[field]}" for field in fields)
               print(f"::notice title={row['candidate']} / {row['mode']}::{details}")
