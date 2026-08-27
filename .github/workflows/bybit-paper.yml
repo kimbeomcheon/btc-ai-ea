@@ -1,0 +1,58 @@
+name: Bybit V11.2 Dry-Run Paper Trader
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */4 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bybit-v112-paper
+  cancel-in-progress: false
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Restore latest successful paper state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p paper_state
+          run_id="$(gh run list --workflow bybit-paper.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --name bybit-paper-state --dir paper_state
+          else
+            echo "No prior successful paper artifact; starting from initial equity."
+          fi
+
+      - name: Run public-data paper trader
+        run: python paper_trader.py --state-dir paper_state
+
+      - name: Upload paper state
+        uses: actions/upload-artifact@v4
+        with:
+          name: bybit-paper-state
+          path: |
+            paper_state/state.json
+            paper_state/report.json
+          if-no-files-found: error
+          retention-days: 90
