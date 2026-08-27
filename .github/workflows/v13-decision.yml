@@ -1,0 +1,68 @@
+name: V13 AI Decision Engine Research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v13-decision-engine
+    paths:
+      - "v13_decision_engine.py"
+      - "requirements.txt"
+      - ".github/workflows/v13-decision.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v13-decision-engine
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout V13 research branch
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Syntax validation
+        run: python -m py_compile v13_decision_engine.py
+
+      - name: Run V13 decision research
+        run: python v13_decision_engine.py --start 2019-09-08 --initial 10000
+
+      - name: Publish V13 scorecard
+        shell: bash
+        run: |
+          echo "## V13 AI Decision Engine scorecard" >> "$GITHUB_STEP_SUMMARY"
+          python -c "import pandas as pd; print(pd.read_csv('results_v13/v13_scorecard.csv').to_markdown(index=False))" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import pandas as pd
+          scorecard = pd.read_csv("results_v13/v13_scorecard.csv")
+          fields = ["gate", "overfit_fail", "leakage_pass", "base_cagr", "base_mdd",
+                    "base_sharpe", "base_pf", "oos_cagr", "oos_mdd", "robustness",
+                    "adaptive2x_mdd", "frozen2x_mdd", "delay_mdd", "hard_stop_any",
+                    "turnover", "rebalances", "fees", "slippage", "funding",
+                    "avg_gross", "max_gross"]
+          for _, row in scorecard.iterrows():
+              details = ", ".join(f"{field}={row[field]}" for field in fields)
+              print(f"::notice title={row['candidate']} / {row['mode']}::{details}")
+          PY
+
+      - name: Upload complete V13 research artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v13-decision-engine-results
+          path: results_v13/
+          if-no-files-found: error
+          retention-days: 30
