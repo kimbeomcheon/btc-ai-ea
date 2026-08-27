@@ -1,0 +1,46 @@
+name: V12 Alpha Research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v12-alpha-research
+    paths:
+      - "v12_backtest.py"
+      - "requirements.txt"
+      - ".github/workflows/v12-alpha.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Syntax validation
+        run: python -m py_compile v12_backtest.py
+
+      - name: Run V12 alpha research
+        run: python v12_backtest.py --start 2019-09-08 --initial 10000
+
+      - name: Upload separated research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: v12-alpha-research-results
+          path: results_v12/
+          if-no-files-found: error
+          retention-days: 30
