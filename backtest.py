@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V11.0 V9-Engine / Futures-Execution Backtester
+BTC AI EA — V11.0.1 V9-Engine / Futures-Execution Backtester
 ==========================================================
 
 Purpose
@@ -474,6 +474,9 @@ def run_one(x,funding,s,initial):
     sigcols=["regime","rv30","rv_ratio","shock","risk_fast","risk_mid","risk_slow",
              "ret5","ret20","dd20","dclose","daily_seq","entry_hi","exit_lo","atr4h"]
     xd[sigcols]=xd[sigcols].shift(1)
+    # The one-bar signal shift intentionally creates NaN in the first delayed row.
+    # Remove only rows whose delayed signal state is incomplete before simulation.
+    xd=xd.dropna(subset=sigcols).copy()
     delayed,_,hd,execd=simulate(xd,funding,s,base_cost,initial,True)
     return {
         "base":metrics(base,initial),"adaptive2x":metrics(adaptive2,initial),
@@ -549,7 +552,7 @@ def main():
                 z["base"]["cagr"])
     selected=max(results,key=key)
     summary={
-        "version":"V11.0",
+        "version":"V11.0.1",
         "architecture":"V9 regime/risk/convex engine on futures/funding execution",
         "selected":selected["candidate"]["name"],
         "development_gate_passed":selected["development_gate"],
@@ -579,3 +582,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
