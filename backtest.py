@@ -1,45 +1,40 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V9.3 Cost-Aware Execution Architecture Backtester
-==============================================================
+BTC AI EA — V9.4 Frozen-Cost Resilient Execution Backtester
+============================================================
 
-Why V9.3 exists
+Why V9.4 exists
 ---------------
-V9.2 reduced rebalances and transaction costs while keeping the selected shadow
-portfolio inside the 15% drawdown budget, but the selected model still failed
-when fee + slippage assumptions were doubled. V9.3 freezes the V9.2C return,
-risk and convex-exposure engine and changes only EXECUTION ECONOMICS.
+V9.3 materially reduced turnover and survived adaptive 2x transaction costs,
+but the selected V93D_BATCH1 still failed the harder frozen-decision 2x-cost
+stress by a narrow margin (15.31% MDD vs. the 15% budget) and reduced base costs
+by only 10.6% versus the V9.2C control instead of the 15% development target.
 
-Architecture
-------------
-1) SIGNAL/RISK ENGINE: frozen from V9.2C_COOLDOWN2.
-2) COST-AWARE NO-TRADE BAND: the ordinary rebalance deadband widens when the
-   estimated one-way trading cost is large relative to current 4H ATR. Higher
-   assumed costs therefore require a larger exposure correction before trading.
-3) BATCH REBALANCE INTERVAL: non-urgent exposure increases/drift corrections can
-   be deferred for a small number of completed 4H bars. De-risking bypasses it.
-4) TACTICAL RE-ENTRY COOLDOWN: after a tactical exit, repeated breakout re-entry
-   can be blocked briefly to reduce whipsaw turnover.
-5) URGENT DE-RISK BYPASS: zero exposure, worsening market-risk state, pyramid
-   stage reduction, tactical exit and regime risk reductions remain immediate.
-6) STRESS INTEGRITY: 2x costs are tested in two ways: adaptive (the execution
-   engine sees the higher cost) and frozen-decision (actual cost doubles while
-   the no-trade band still uses the base cost estimate). This prevents the cost
-   stress from being passed solely by mechanically changing behavior in-test.
-7) VALIDATION: full history, 15% terminal gate, walk-forward OOS, +4H delay,
-   stress periods and an 18-cell execution robustness grid.
+V9.4 is the final V9.x fine-tuning iteration. It freezes the V9.2C/V9.3 signal,
+market-risk and convex exposure engine and changes only two execution controls:
 
-Research-integrity note
------------------------
-V9.3 is development-stage research informed by V9.2 full-sample results. Its
-walk-forward windows are stability checks, not pristine untouched OOS evidence
-for the entire research program.
+1) EFFECTIVE-DEADBAND CAP: V9.3's cost-aware no-trade band remains, but its
+   upper bound is candidate-specific. This prevents adaptive cost stress from
+   widening the band into the unstable region observed near 12%+ average band.
+2) EXECUTION RESERVE: a small, stress-independent 1-3% haircut is applied to
+   positive target exposure after the model has decided its desired exposure.
+   This is not a predictor and does not change regime/risk/pyramid signals. It
+   creates a friction reserve that is still present in frozen-decision tests.
+3) BATCH REBALANCE: ordinary non-urgent corrections retain V9.3's short minimum
+   interval. All urgent de-risk events bypass the throttle.
+4) STRESS INTEGRITY: adaptive 2x and frozen-decision 2x costs are both required.
+   Frozen-decision stress doubles realized fee/slippage while keeping the base
+   execution-cost estimate, so the strategy cannot pass merely by changing its
+   decisions after seeing higher assumed costs.
+5) RESEARCH BOUNDARY: candidates are a narrow, predeclared neighborhood around
+   V9.3's surviving cost-band region. If V9.4 fails, V9.x parameter fine-tuning
+   stops; the next step is architectural redesign, not V9.5 parameter chasing.
 
 Anti-lookahead / anti-martingale rules
 --------------------------------------
 - Daily features use only fully completed prior daily candles.
 - 4H decisions use a completed 4H bar and affect only a later 4H open.
-- Pyramid stages still unlock only after favorable ATR-normalized movement.
+- Pyramid stages unlock only after favorable ATR-normalized movement.
 - No averaging down, martingale, simultaneous long/short hedge or fixed high
   leverage is introduced by the execution layer.
 
@@ -77,7 +72,6 @@ class Strategy:
     fast_days: int
     slow_days: int
     slope_days: int
-    # Stage-0 core exposure. Unlike V7.1, these are intentionally small.
     strong_long: float
     weak_long: float
     tactical_long: float
@@ -88,7 +82,6 @@ class Strategy:
     vol_target: float
     vol_floor_scale: float
     max_long: float
-    # Convex exposure staircase. Stages are unlocked only by favorable movement.
     convex_add1: float
     convex_add2: float
     convex_add3: float
@@ -97,7 +90,7 @@ class Strategy:
     convex_trigger3_atr: float
     convex_stepdown_atr: float
     tactical_min_stage: int
-    # V9.2 execution hysteresis / turnover control.
+    # V9.2 execution hysteresis.
     rebalance_deadband: float
     stage_up_confirm_bars: int
     stage_reentry_cooldown_bars: int
@@ -108,7 +101,10 @@ class Strategy:
     rebalance_min_interval_bars: int
     tactical_reentry_cooldown_bars: int
     legacy_v92_execution: bool
-    # Downside fields are retained for feature compatibility but disabled in V9.
+    # V9.4 frozen-cost resilience.
+    max_effective_deadband: float
+    execution_reserve: float
+    # Downside fields retained for feature compatibility; disabled in V9.
     down_sv_warn: float
     down_sv_high: float
     down_ratio_warn: float
@@ -146,6 +142,7 @@ BASE_V92C = dict(
     state_change_rebalance=False,
     cost_band_mult=0.0, rebalance_min_interval_bars=0,
     tactical_reentry_cooldown_bars=0, legacy_v92_execution=False,
+    max_effective_deadband=0.14, execution_reserve=0.0,
     down_sv_warn=9.0, down_sv_high=9.0,
     down_ratio_warn=9.0, down_ratio_high=9.0,
     down_dd10_warn=-0.99, down_dd10_high=-0.99, down_ret3_high=-0.99,
@@ -163,33 +160,50 @@ def _mk_strategy(name: str, **overrides) -> Strategy:
 
 
 CANDIDATES = [
-    # Dynamic band only: isolate the cost/ATR no-trade hypothesis.
-    _mk_strategy("V93A_COST05", cost_band_mult=0.50),
-    _mk_strategy("V93B_COST075", cost_band_mult=0.75),
-    _mk_strategy("V93C_COST10", cost_band_mult=1.00),
-    # Batch non-urgent corrections after the cost-aware band is applied.
+    # Narrow V9.4 neighborhood: V9.3 C/D showed that cost-band ~1.0 improves
+    # frozen-cost resilience, while adaptive stress needs a lower band ceiling.
     _mk_strategy(
-        "V93D_BATCH1", cost_band_mult=0.75,
-        rebalance_min_interval_bars=1,
-    ),
-    # Add a brief tactical re-entry cooldown to suppress breakout whipsaw.
-    _mk_strategy(
-        "V93E_TACTICAL2", cost_band_mult=0.75,
-        rebalance_min_interval_bars=1, tactical_reentry_cooldown_bars=2,
-    ),
-    # V9.2 robustness showed convex re-entry cooldown=4 was a nearby 15%-MDD
-    # survivor. Combine that survivor geometry with cost-aware execution.
-    _mk_strategy(
-        "V93F_K4_COST05", rebalance_deadband=0.030,
-        stage_reentry_cooldown_bars=4, cost_band_mult=0.50,
-        rebalance_min_interval_bars=1, tactical_reentry_cooldown_bars=2,
+        "V94A_R01_CAP115", cost_band_mult=1.00,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.115,
+        execution_reserve=0.01,
     ),
     _mk_strategy(
-        "V93G_BALANCED", stage_reentry_cooldown_bars=4,
-        cost_band_mult=0.75, rebalance_min_interval_bars=1,
-        tactical_reentry_cooldown_bars=2,
+        "V94B_R02_CAP115", cost_band_mult=1.00,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.115,
+        execution_reserve=0.02,
     ),
-    # Exact V9.2 selected control. No V9.3 execution economics.
+    _mk_strategy(
+        "V94C_R03_CAP115", cost_band_mult=1.00,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.115,
+        execution_reserve=0.03,
+    ),
+    _mk_strategy(
+        "V94D_R02_CAP110", cost_band_mult=1.00,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.110,
+        execution_reserve=0.02,
+    ),
+    _mk_strategy(
+        "V94E_R02_I2", cost_band_mult=1.00,
+        rebalance_min_interval_bars=2, max_effective_deadband=0.115,
+        execution_reserve=0.02,
+    ),
+    _mk_strategy(
+        "V94F_C095_R02", cost_band_mult=0.95,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.115,
+        execution_reserve=0.02,
+    ),
+    _mk_strategy(
+        "V94G_C105_R02", cost_band_mult=1.05,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.115,
+        execution_reserve=0.02,
+    ),
+    # Exact V9.3 selected execution control.
+    _mk_strategy(
+        "V93D_CONTROL", cost_band_mult=0.75,
+        rebalance_min_interval_bars=1, max_effective_deadband=0.14,
+        execution_reserve=0.0,
+    ),
+    # Exact V9.2C execution control.
     _mk_strategy("V92C_CONTROL", legacy_v92_execution=True),
 ]
 
@@ -209,7 +223,7 @@ class RiskRules:
 
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v9.3/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "btc-ai-ea-v9.4/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -625,8 +639,9 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     if len(x) < 1500:
         raise RuntimeError("Insufficient usable 4H history")
 
-    # Realized costs can be stressed independently from the cost estimate used
-    # by the no-trade band. By default both are the same.
+    # Realized transaction costs can be stressed independently from the cost
+    # estimate that drives execution decisions. Frozen-decision stress uses
+    # base decision_costs while doubling realized costs.
     if decision_costs is None:
         decision_costs = costs
 
@@ -675,6 +690,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
     skipped_rebalances = 0
     cost_band_skips = 0
     interval_blocks = 0
+    reserve_applied_bars = 0
     effective_deadband_sum = 0.0
     effective_deadband_count = 0
     last_rebalance_bar_index = -10**9
@@ -825,15 +841,28 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 convex_enabled=convex_enabled,
             )
 
-        # V9.3 cost-aware execution. The dynamic no-trade band expands when
-        # trading cost is large relative to 4H ATR. It only throttles ordinary
-        # exposure corrections/increases; de-risking remains immediate.
+        # V9.4 stress-independent execution reserve. The model/risk engine has
+        # already decided `desired`; only the final positive exposure sent to
+        # the execution layer is hair-cut. This reserve remains unchanged in
+        # frozen-decision cost stress and therefore cannot adapt after seeing
+        # the stressed realized fee/slippage assumption.
+        model_desired = desired
+        if (not s.legacy_v92_execution and desired > 0.0 and
+                s.execution_reserve > 0.0):
+            desired = desired * (1.0 - float(np.clip(s.execution_reserve, 0.0, 0.10)))
+            reserve_applied_bars += 1
+
+        # Cost-aware no-trade band from V9.3, with a V9.4 candidate-specific
+        # upper cap. The cap is especially important in adaptive 2x stress:
+        # it prevents cost awareness from mechanically widening the band into
+        # a stale-exposure region. Urgent de-risk always bypasses the throttle.
         cost_rate = (decision_costs.fee_bps + decision_costs.slippage_bps) / 10_000.0
         atr_frac = max(a / max(o, 1e-12), 1e-4)
         cost_component = s.cost_band_mult * cost_rate / atr_frac
+        deadband_cap = max(s.rebalance_deadband, float(s.max_effective_deadband))
         effective_deadband = float(np.clip(
             s.rebalance_deadband + cost_component,
-            s.rebalance_deadband, 0.14
+            s.rebalance_deadband, deadband_cap
         ))
         effective_deadband_sum += effective_deadband
         effective_deadband_count += 1
@@ -1048,8 +1077,8 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
                 "cushion_atr":convex_cushion_atr, "giveback_atr":convex_giveback_atr,
             })
 
-        # Existing tactical cooldown counts completed 4H bars. A cooldown
-        # created by an exit on this bar is not decremented immediately.
+        # Cooldown that existed at bar start counts one completed 4H bar. A
+        # cooldown created by an exit on this bar is not decremented immediately.
         if tactical_cooldown_was_active and tactical_reentry_cooldown > 0:
             tactical_reentry_cooldown -= 1
 
@@ -1068,6 +1097,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
             "stage_up_confirm_count":stage_up_confirm_count,
             "stage_reentry_cooldown":stage_reentry_cooldown,
             "tactical_reentry_cooldown":tactical_reentry_cooldown,
+            "model_exposure_before_reserve":model_desired,
             "effective_deadband":effective_deadband,
             "tactical_side":tactical_side, "day_lock":day_lock, "week_lock":week_lock,
         })
@@ -1103,6 +1133,7 @@ def backtest(df1h: pd.DataFrame, s: Strategy, costs: CostModel, rules: RiskRules
         "cost_band_skips":cost_band_skips,
         "interval_blocks":interval_blocks,
         "tactical_reentry_blocks":tactical_reentry_blocks,
+        "reserve_applied_bars":reserve_applied_bars,
         "avg_effective_deadband":(
             effective_deadband_sum / max(effective_deadband_count, 1)
         ),
@@ -1157,6 +1188,7 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
         "cost_band_skips":int(extra.get("cost_band_skips", 0)),
         "interval_blocks":int(extra.get("interval_blocks", 0)),
         "tactical_reentry_blocks":int(extra.get("tactical_reentry_blocks", 0)),
+        "reserve_applied_bars":int(extra.get("reserve_applied_bars", 0)),
         "avg_effective_deadband":float(extra.get("avg_effective_deadband", 0.0)),
         "stage_up_deferred":int(extra.get("stage_up_deferred", 0)),
         "stage_cooldown_blocks":int(extra.get("stage_cooldown_blocks", 0)),
@@ -1171,7 +1203,7 @@ def metrics(eq: pd.DataFrame, trades: pd.DataFrame, extra: dict, initial: float)
 
 
 def objective(m):
-    """Base-sample efficiency score; 2x-cost survival is ranked separately."""
+    """Base-sample efficiency score. Stress survival is ranked separately."""
     if not m:
         return -1e9
     sh = m.get("sharpe_365", -1)
@@ -1188,20 +1220,25 @@ def objective(m):
     )
 
 
-def v93_joint_score(row):
-    """Rank return/risk efficiency across base and 2x realized-cost stress."""
-    base_mdd = abs(float(row["shadow_max_drawdown"]))
-    stress_mdd = abs(float(row["stress2x_shadow_mdd"]))
-    base_excess = max(0.0, base_mdd - 0.15)
-    stress_excess = max(0.0, stress_mdd - 0.15)
+def v94_joint_score(row):
+    """Joint efficiency across base, adaptive 2x and frozen-decision 2x."""
+    b_mdd = abs(float(row["shadow_max_drawdown"]))
+    a_mdd = abs(float(row["stress2x_shadow_mdd"]))
+    f_mdd = abs(float(row["frozen2x_shadow_mdd"]))
+    b_ex = max(0.0, b_mdd - 0.15)
+    a_ex = max(0.0, a_mdd - 0.15)
+    f_ex = max(0.0, f_mdd - 0.15)
     return (
-        0.55*float(row["shadow_cagr"]) + 0.45*float(row["stress2x_shadow_cagr"])
-        - 0.30*base_mdd - 0.45*stress_mdd
-        + 0.035*float(row["shadow_sharpe_365"])
-        + 0.010*min(float(row["shadow_profit_factor_daily"]), 5.0)
-        - 6.0*base_excess - 9.0*stress_excess
+        0.40*float(row["shadow_cagr"])
+        + 0.30*float(row["stress2x_shadow_cagr"])
+        + 0.30*float(row["frozen2x_shadow_cagr"])
+        - 0.25*b_mdd - 0.35*a_mdd - 0.40*f_mdd
+        + 0.030*float(row["shadow_sharpe_365"])
+        + 0.010*min(float(row["shadow_profit_factor_daily"]),5.0)
+        - 6.0*b_ex - 9.0*a_ex - 12.0*f_ex
         - 0.08*int(bool(row["shadow_hard_breached"]))
         - 0.12*int(bool(row["stress2x_shadow_hard_breached"]))
+        - 0.16*int(bool(row["frozen2x_shadow_hard_breached"]))
     )
 
 
@@ -1259,7 +1296,8 @@ def walk_forward(data, costs, rules, initial):
             anchor += pd.DateOffset(years=1); continue
 
         scored=[]
-        for s in CANDIDATES:
+        research_candidates = [z for z in CANDIDATES if z.name.startswith("V94")]
+        for s in research_candidates:
             eq,tr,ev,ex=backtest(train,s,costs,rules,initial,enforce_hard_stop=False)
             m=metrics(eq,tr,ex,initial)
             scored.append((
@@ -1303,50 +1341,69 @@ def walk_forward(data, costs, rules, initial):
 
 
 def robustness_grid(data, best: Strategy, costs, rules, initial):
+    """Nearby V9.4 execution robustness with both 2x stress semantics.
+
+    Signal, regime, market-risk and convex-pyramid parameters stay frozen.
+    Only cost-band strength, band cap and execution reserve move locally.
+    """
     rows=[]
-    # 18 nearby execution combinations. Signal/risk/exposure parameters stay
-    # frozen; only cost-band strength, batch interval and tactical cooldown vary.
-    stress_costs = CostModel(costs.fee_bps*2, costs.slippage_bps*2)
-    for cost_mult in (0.50,0.75,1.00):
-        for interval in (0,1,2):
-            for tac_cd in (0,2):
-                s=replace(
+    stress_costs=CostModel(costs.fee_bps*2, costs.slippage_bps*2)
+    # 3 x 2 x 2 = 12 nearby cells. Keep the batch interval from the selected
+    # candidate so the grid isolates the two new V9.4 mechanisms.
+    for cost_mult in (0.95,1.00,1.05):
+        for cap in (0.110,0.115):
+            for reserve in (0.01,0.03):
+                z=replace(
                     best,
-                    name=f"{best.name}_CB{cost_mult:.2f}_I{interval}_T{tac_cd}",
+                    name=f"{best.name}_CB{cost_mult:.2f}_CAP{cap:.3f}_R{reserve:.2f}",
                     cost_band_mult=cost_mult,
-                    rebalance_min_interval_bars=interval,
-                    tactical_reentry_cooldown_bars=tac_cd,
+                    max_effective_deadband=cap,
+                    execution_reserve=reserve,
+                    legacy_v92_execution=False,
                 )
-                seq,str_,sev,sex=backtest(data,s,costs,rules,initial,enforce_hard_stop=False)
-                sm=metrics(seq,str_,sex,initial)
-                req,rtr,rev,rex=backtest(data,s,costs,rules,initial,enforce_hard_stop=True)
-                rm=metrics(req,rtr,rex,initial)
-                s2e,s2t,s2v,s2x=backtest(
-                    data,s,stress_costs,rules,initial,enforce_hard_stop=False
+                be,bt,bv,bx=backtest(data,z,costs,rules,initial,enforce_hard_stop=False)
+                bm=metrics(be,bt,bx,initial)
+                bre,brt,brv,brx=backtest(data,z,costs,rules,initial,enforce_hard_stop=True)
+                brm=metrics(bre,brt,brx,initial)
+
+                ae,at,av,ax=backtest(data,z,stress_costs,rules,initial,enforce_hard_stop=False)
+                am=metrics(ae,at,ax,initial)
+                are,art,arv,arx=backtest(data,z,stress_costs,rules,initial,enforce_hard_stop=True)
+                arm=metrics(are,art,arx,initial)
+
+                fe,ft,fv,fx=backtest(
+                    data,z,stress_costs,rules,initial,enforce_hard_stop=False,
+                    decision_costs=costs
                 )
-                s2m=metrics(s2e,s2t,s2x,initial)
-                s2re,s2rt,s2rv,s2rx=backtest(
-                    data,s,stress_costs,rules,initial,enforce_hard_stop=True
+                fm=metrics(fe,ft,fx,initial)
+                fre,frt,frv,frx=backtest(
+                    data,z,stress_costs,rules,initial,enforce_hard_stop=True,
+                    decision_costs=costs
                 )
-                s2rm=metrics(s2re,s2rt,s2rx,initial)
+                frm=metrics(fre,frt,frx,initial)
+
                 rows.append({
                     "cost_band_mult":cost_mult,
-                    "rebalance_min_interval_bars":interval,
-                    "tactical_reentry_cooldown_bars":tac_cd,
-                    "shadow_cagr":sm["cagr"],"shadow_mdd":sm["max_drawdown"],
-                    "shadow_sharpe":sm["sharpe_365"],
-                    "shadow_pf_daily":sm["profit_factor_daily"],
-                    "shadow_rebalances":sm["rebalances"],
-                    "shadow_costs_paid_usd":sm["costs_paid_usd"],
-                    "shadow_turnover_x_initial":sm["gross_turnover_x_initial"],
-                    "shadow_avg_effective_deadband":sm["avg_effective_deadband"],
-                    "shadow_hard_breached":sm["hard_breached"],
-                    "risk_hard_stopped":rm["hard_stopped"],
-                    "stress2x_cagr":s2m["cagr"],
-                    "stress2x_mdd":s2m["max_drawdown"],
-                    "stress2x_rebalances":s2m["rebalances"],
-                    "stress2x_hard_breached":s2m["hard_breached"],
-                    "stress2x_risk_hard_stopped":s2rm["hard_stopped"],
+                    "max_effective_deadband":cap,
+                    "execution_reserve":reserve,
+                    "rebalance_min_interval_bars":z.rebalance_min_interval_bars,
+                    "shadow_cagr":bm["cagr"],"shadow_mdd":bm["max_drawdown"],
+                    "shadow_sharpe":bm["sharpe_365"],
+                    "shadow_pf_daily":bm["profit_factor_daily"],
+                    "shadow_rebalances":bm["rebalances"],
+                    "shadow_costs_paid_usd":bm["costs_paid_usd"],
+                    "shadow_turnover_x_initial":bm["gross_turnover_x_initial"],
+                    "shadow_avg_effective_deadband":bm["avg_effective_deadband"],
+                    "shadow_hard_breached":bm["hard_breached"],
+                    "risk_hard_stopped":brm["hard_stopped"],
+                    "adaptive2x_cagr":am["cagr"],
+                    "adaptive2x_mdd":am["max_drawdown"],
+                    "adaptive2x_hard_breached":am["hard_breached"],
+                    "adaptive2x_risk_hard_stopped":arm["hard_stopped"],
+                    "frozen2x_cagr":fm["cagr"],
+                    "frozen2x_mdd":fm["max_drawdown"],
+                    "frozen2x_hard_breached":fm["hard_breached"],
+                    "frozen2x_risk_hard_stopped":frm["hard_stopped"],
                 })
     return pd.DataFrame(rows)
 
@@ -1475,19 +1532,25 @@ def main():
     stress_costs=CostModel(args.fee_bps*2,args.slippage_bps*2)
     rules=RiskRules()
 
-    # Base candidate runs.
+    # Base candidate/control runs.
     cand,outputs=run_candidates(data,costs,rules,args.initial)
+    control_name="V92C_CONTROL"
+    v93_control_name="V93D_CONTROL"
+    control_shadow=outputs[control_name]["shadow"][3]
+    control_risk=outputs[control_name]["risk"][3]
+    v93_control_shadow=outputs[v93_control_name]["shadow"][3]
 
-    # 2x realized costs, with adaptive cost-aware decision band.
+    # Adaptive 2x: both realized costs and the execution engine's cost estimate
+    # are doubled. V9.4's deadband cap prevents over-adaptation.
     stress_rows=[]; stress_shadow_map={}; stress_risk_map={}
-    for s in CANDIDATES:
-        se,st,sv,sx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=False)
+    for z in CANDIDATES:
+        se,st,sv,sx=backtest(data,z,stress_costs,rules,args.initial,enforce_hard_stop=False)
         sm=metrics(se,st,sx,args.initial)
-        re,rt,rv,rx=backtest(data,s,stress_costs,rules,args.initial,enforce_hard_stop=True)
+        re,rt,rv,rx=backtest(data,z,stress_costs,rules,args.initial,enforce_hard_stop=True)
         rm=metrics(re,rt,rx,args.initial)
-        stress_shadow_map[s.name]=sm; stress_risk_map[s.name]=rm
+        stress_shadow_map[z.name]=sm; stress_risk_map[z.name]=rm
         stress_rows.append({
-            "strategy":s.name,
+            "strategy":z.name,
             "stress2x_shadow_cagr":sm["cagr"],
             "stress2x_shadow_mdd":sm["max_drawdown"],
             "stress2x_shadow_sharpe":sm["sharpe_365"],
@@ -1503,28 +1566,31 @@ def main():
         })
     stress_df=pd.DataFrame(stress_rows)
 
-    # Frozen-decision 2x stress: actual costs double but execution band still
-    # uses the base 1x cost estimate. This is a harder anti-gaming diagnostic.
+    # Frozen-decision 2x: realized fee/slippage doubles but decisions still use
+    # the base 1x cost estimate. This is the V9.3 failure mode V9.4 must fix.
     frozen_rows=[]; frozen_shadow_map={}; frozen_risk_map={}
-    for s in CANDIDATES:
+    for z in CANDIDATES:
         fe,ft,fv,fx=backtest(
-            data,s,stress_costs,rules,args.initial,enforce_hard_stop=False,
+            data,z,stress_costs,rules,args.initial,enforce_hard_stop=False,
             decision_costs=costs
         )
         fm=metrics(fe,ft,fx,args.initial)
         fre,frt,frv,frx=backtest(
-            data,s,stress_costs,rules,args.initial,enforce_hard_stop=True,
+            data,z,stress_costs,rules,args.initial,enforce_hard_stop=True,
             decision_costs=costs
         )
         frm=metrics(fre,frt,frx,args.initial)
-        frozen_shadow_map[s.name]=fm; frozen_risk_map[s.name]=frm
+        frozen_shadow_map[z.name]=fm; frozen_risk_map[z.name]=frm
         frozen_rows.append({
-            "strategy":s.name,
+            "strategy":z.name,
             "frozen2x_shadow_cagr":fm["cagr"],
             "frozen2x_shadow_mdd":fm["max_drawdown"],
             "frozen2x_shadow_rebalances":fm["rebalances"],
             "frozen2x_shadow_costs_paid_usd":fm["costs_paid_usd"],
+            "frozen2x_shadow_turnover_x_initial":fm["gross_turnover_x_initial"],
             "frozen2x_shadow_hard_breached":fm["hard_breached"],
+            "frozen2x_risk_cagr":frm["cagr"],
+            "frozen2x_risk_mdd":frm["max_drawdown"],
             "frozen2x_risk_hard_stopped":frm["hard_stopped"],
         })
     frozen_df=pd.DataFrame(frozen_rows)
@@ -1536,34 +1602,46 @@ def main():
     cand["frozen2x_gate"]=(
         cand["frozen2x_shadow_mdd"].abs() <= rules.hard_drawdown
     ) & (~cand["frozen2x_shadow_hard_breached"].astype(bool))
-    cand["v93_score"]=cand.apply(v93_joint_score,axis=1)
-    # Primary research ranking: survive adaptive 2x cost first, then base 15%
-    # MDD, then frozen-decision 2x diagnostic, then joint efficiency/turnover.
-    cand=cand.sort_values(
-        ["stress2x_gate","mdd_gate","frozen2x_gate","v93_score","shadow_gross_turnover_x_initial"],
-        ascending=[False,False,False,False,True]
+    cand["triple_survival_gate"]=cand["mdd_gate"] & cand["stress2x_gate"] & cand["frozen2x_gate"]
+    cand["cost_minus_15pct_gate"]=cand["shadow_costs_paid_usd"] <= 0.85*control_shadow["costs_paid_usd"]
+    cand["rebalances_minus_15pct_gate"]=cand["shadow_rebalances"] <= 0.85*control_shadow["rebalances"]
+    cand["base_cagr_15_gate"]=cand["shadow_cagr"] >= 0.15
+    cand["v94_gate"]=(
+        cand["triple_survival_gate"] & cand["cost_minus_15pct_gate"] &
+        cand["rebalances_minus_15pct_gate"] & cand["base_cagr_15_gate"]
     )
+    cand["v94_score"]=cand.apply(v94_joint_score,axis=1)
+    cand["research_candidate"]=cand["strategy"].astype(str).str.startswith("V94")
+
+    # Historical controls remain visible but cannot win the V9.4 selection.
+    cand=cand.sort_values(
+        ["research_candidate","v94_gate","triple_survival_gate","cost_minus_15pct_gate",
+         "v94_score","shadow_costs_paid_usd"],
+        ascending=[False,False,False,False,False,True]
+    )
+    research=cand.loc[cand["research_candidate"]]
+    if research.empty:
+        raise RuntimeError("No V9.4 research candidates available")
+    best_name=str(research.iloc[0].strategy)
+    best_s=next(z for z in CANDIDATES if z.name==best_name)
+    seq,str_,sev,bsm=outputs[best_name]["shadow"]
+    req,rtr,rev,brm=outputs[best_name]["risk"]
+
     cand.to_csv(out/"candidate_summary.csv",index=False)
     stress_df.to_csv(out/"cost_stress_2x_adaptive.csv",index=False)
     frozen_df.to_csv(out/"cost_stress_2x_frozen_decision.csv",index=False)
-    pd.DataFrame([s.__dict__ for s in CANDIDATES]).to_csv(out/"candidate_configs.csv",index=False)
-    cand.loc[cand["mdd_gate"]].to_csv(out/"mdd15_survivor_candidates.csv",index=False)
-    cand.loc[cand["stress2x_gate"]].to_csv(out/"stress2x_survivor_candidates.csv",index=False)
+    pd.DataFrame([z.__dict__ for z in CANDIDATES]).to_csv(out/"candidate_configs.csv",index=False)
+    cand.loc[cand["triple_survival_gate"]].to_csv(out/"triple_survivor_candidates.csv",index=False)
+    cand.loc[cand["v94_gate"]].to_csv(out/"v94_gate_survivor_candidates.csv",index=False)
     cand[[
-        "strategy","mdd_gate","stress2x_gate","frozen2x_gate",
+        "strategy","research_candidate","v94_gate","triple_survival_gate",
+        "mdd_gate","stress2x_gate","frozen2x_gate","base_cagr_15_gate",
+        "cost_minus_15pct_gate","rebalances_minus_15pct_gate",
         "shadow_cagr","shadow_max_drawdown","shadow_rebalances",
         "shadow_costs_paid_usd","shadow_gross_turnover_x_initial",
         "stress2x_shadow_cagr","stress2x_shadow_mdd",
-        "stress2x_shadow_rebalances","v93_score"
-    ]].to_csv(out/"cost_aware_candidate_frontier.csv",index=False)
-
-    best_name=str(cand.iloc[0].strategy)
-    best_s=next(s for s in CANDIDATES if s.name==best_name)
-    seq,str_,sev,bsm=outputs[best_name]["shadow"]
-    req,rtr,rev,brm=outputs[best_name]["risk"]
-    control_name="V92C_CONTROL"
-    control_shadow=outputs[control_name]["shadow"][3]
-    control_risk=outputs[control_name]["risk"][3]
+        "frozen2x_shadow_cagr","frozen2x_shadow_mdd","v94_score"
+    ]].to_csv(out/"frozen_cost_candidate_frontier.csv",index=False)
 
     seq.to_csv(out/"equity_shadow.csv")
     req.to_csv(out/"equity_risk_gated.csv")
@@ -1587,18 +1665,21 @@ def main():
         cs["fraction"]=cs["bars"]/max(len(seq),1)
         cs.to_csv(out/"convex_stage_distribution.csv",index=False)
 
+    # Walk-forward stability. Controls are excluded from the rolling candidate
+    # choice so this tests only the predeclared V9.4 neighborhood.
     wf=walk_forward(data,costs,rules,args.initial)
     wf.to_csv(out/"walk_forward.csv",index=False)
 
+    # +4H execution-delay stress (signal_delay_bars 1 -> 2).
     delay_rows=[]; delay_shadow_map={}; delay_risk_map={}
-    for s in CANDIDATES:
-        de,dt,dv,dx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=False)
+    for z in CANDIDATES:
+        de,dt,dv,dx=backtest(data,z,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=False)
         dm=metrics(de,dt,dx,args.initial)
-        dre,drt,drv,drx=backtest(data,s,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=True)
+        dre,drt,drv,drx=backtest(data,z,costs,rules,args.initial,signal_delay_bars=2,enforce_hard_stop=True)
         drm=metrics(dre,drt,drx,args.initial)
-        delay_shadow_map[s.name]=dm; delay_risk_map[s.name]=drm
+        delay_shadow_map[z.name]=dm; delay_risk_map[z.name]=drm
         delay_rows.append({
-            "strategy":s.name,"shadow_cagr":dm["cagr"],
+            "strategy":z.name,"shadow_cagr":dm["cagr"],
             "shadow_mdd":dm["max_drawdown"],"shadow_sharpe":dm["sharpe_365"],
             "shadow_rebalances":dm["rebalances"],
             "shadow_costs_paid_usd":dm["costs_paid_usd"],
@@ -1607,19 +1688,29 @@ def main():
         })
     pd.DataFrame(delay_rows).to_csv(out/"execution_delay_stress.csv",index=False)
 
-    # Attribution.
+    # Attribution against the two historical execution controls.
     ce,ct,cv,cx=backtest(data,best_s,costs,rules,args.initial,tactical_enabled=False,enforce_hard_stop=False)
     core_m=metrics(ce,ct,cx,args.initial)
     pd.DataFrame([
-        {"variant":"selected V9.3 cost-aware execution",**bsm},
-        {"variant":"V9.2C exact control",**control_shadow},
-        {"variant":"V9.3 selected core-only",**core_m},
-        {"variant":"V9.3 selected adaptive 2x cost",**stress_shadow_map[best_name]},
-        {"variant":"V9.3 selected frozen-decision 2x cost",**frozen_shadow_map[best_name]},
+        {"variant":"selected V9.4 frozen-cost resilient execution",**bsm},
+        {"variant":"V9.3D exact execution control",**v93_control_shadow},
+        {"variant":"V9.2C exact execution control",**control_shadow},
+        {"variant":"V9.4 selected core-only",**core_m},
+        {"variant":"V9.4 selected adaptive 2x cost",**stress_shadow_map[best_name]},
+        {"variant":"V9.4 selected frozen-decision 2x cost",**frozen_shadow_map[best_name]},
     ]).to_csv(out/"attribution.csv",index=False)
 
     robust=robustness_grid(data,best_s,costs,rules,args.initial)
     robust.to_csv(out/"robustness_grid.csv",index=False)
+    robust_triple=(
+        (~robust["shadow_hard_breached"].astype(bool)) &
+        (robust["shadow_mdd"].abs() <= rules.hard_drawdown) &
+        (~robust["adaptive2x_hard_breached"].astype(bool)) &
+        (robust["adaptive2x_mdd"].abs() <= rules.hard_drawdown) &
+        (~robust["frozen2x_hard_breached"].astype(bool)) &
+        (robust["frozen2x_mdd"].abs() <= rules.hard_drawdown)
+    )
+    robust_triple_ratio=float(robust_triple.mean()) if len(robust) else np.nan
 
     bh=benchmark_buyhold(data,args.initial)
     sma=benchmark_sma200(data,args.initial)
@@ -1628,12 +1719,10 @@ def main():
         stress_shadow_map[best_name],stress_risk_map[best_name],
         delay_shadow_map[best_name],delay_risk_map[best_name],robust
     )
-    gates["frozen2x_risk_not_hard_stopped"] = bool(
-        not frozen_risk_map[best_name]["hard_stopped"]
-    )
-    gates["frozen2x_shadow_mdd_le_15pct"] = bool(
-        abs(frozen_shadow_map[best_name]["max_drawdown"]) <= 0.15
-    )
+    gates["frozen2x_risk_not_hard_stopped"]=bool(not frozen_risk_map[best_name]["hard_stopped"])
+    gates["frozen2x_shadow_mdd_le_15pct"]=bool(abs(frozen_shadow_map[best_name]["max_drawdown"]) <= 0.15)
+    gates["adaptive2x_shadow_mdd_le_15pct"]=bool(abs(stress_shadow_map[best_name]["max_drawdown"]) <= 0.15)
+    gates["robust_triple_survival_ratio"]=robust_triple_ratio
 
     krw=pd.DataFrame(index=seq.index)
     krw["shadow_equity_krw"]=10_000_000*(seq.equity/args.initial)
@@ -1647,25 +1736,35 @@ def main():
         gates["full_shadow_pf_daily_ge_1_4"] and
         gates["full_risk_policy_not_hard_stopped"] and
         gates["stress_2x_risk_not_hard_stopped"] and
+        gates["frozen2x_risk_not_hard_stopped"] and
         gates["delay_risk_not_hard_stopped"] and
         gates["oos_hard_stop_window_ratio"] == 0
     )
-    v93_dev_pass=(
-        bsm["cagr"] >= 0.15 and abs(bsm["max_drawdown"]) <= 0.15 and
-        not stress_risk_map[best_name]["hard_stopped"] and
+    v94_dev_pass=(
+        bsm["cagr"] >= 0.15 and
+        abs(bsm["max_drawdown"]) <= 0.15 and
+        not brm["hard_stopped"] and
         abs(stress_shadow_map[best_name]["max_drawdown"]) <= 0.15 and
+        not stress_risk_map[best_name]["hard_stopped"] and
+        abs(frozen_shadow_map[best_name]["max_drawdown"]) <= 0.15 and
         not frozen_risk_map[best_name]["hard_stopped"] and
         bsm["rebalances"] <= 0.85*control_shadow["rebalances"] and
-        bsm["costs_paid_usd"] <= 0.85*control_shadow["costs_paid_usd"]
+        bsm["costs_paid_usd"] <= 0.85*control_shadow["costs_paid_usd"] and
+        not delay_risk_map[best_name]["hard_stopped"] and
+        (gates["oos_hard_stop_window_ratio"] == 0) and
+        (robust_triple_ratio >= 0.75)
     )
 
     summary={
-        "version":"V9.3 Cost-Aware Execution Architecture",
+        "version":"V9.4 Frozen-Cost Resilient Execution",
+        "v9x_final_iteration":True,
         "data_start":str(data.index.min()),"data_end":str(data.index.max()),
         "rows_1h":len(data),"selected_candidate":best_name,
-        "selection_method":"adaptive 2x-cost survival first; base 15% MDD second; frozen-decision 2x survival third; then joint return/risk score and lower turnover",
+        "selected_config":best_s.__dict__,
+        "selection_method":"V9.4 candidates only; full-sample base/adaptive2x/frozen2x survival + 15% cost/rebalance reduction gates, then joint stress score. Historical controls cannot win selection.",
         "selected_shadow_metrics":bsm,
         "selected_risk_gated_metrics":brm,
+        "v93d_control_shadow_metrics":v93_control_shadow,
         "v92c_control_shadow_metrics":control_shadow,
         "adaptive_2x_shadow_metrics":stress_shadow_map[best_name],
         "adaptive_2x_risk_metrics":stress_risk_map[best_name],
@@ -1678,57 +1777,64 @@ def main():
             "cost_pct":float(bsm["costs_paid_usd"]/max(control_shadow["costs_paid_usd"],1e-12)-1),
             "turnover_delta_x_initial":float(bsm["gross_turnover_x_initial"]-control_shadow["gross_turnover_x_initial"]),
         },
-        "v93_development_pass":bool(v93_dev_pass),
+        "v94_development_pass":bool(v94_dev_pass),
         "development_target":{
             "base_cagr_ge_15pct":bool(bsm["cagr"]>=0.15),
             "base_mdd_le_15pct":bool(abs(bsm["max_drawdown"])<=0.15),
             "adaptive_2x_survives":bool(not stress_risk_map[best_name]["hard_stopped"] and abs(stress_shadow_map[best_name]["max_drawdown"])<=0.15),
-            "frozen_2x_survives":bool(not frozen_risk_map[best_name]["hard_stopped"]),
+            "frozen_2x_survives":bool(not frozen_risk_map[best_name]["hard_stopped"] and abs(frozen_shadow_map[best_name]["max_drawdown"])<=0.15),
             "rebalances_minus_15pct":bool(bsm["rebalances"]<=0.85*control_shadow["rebalances"]),
             "costs_minus_15pct":bool(bsm["costs_paid_usd"]<=0.85*control_shadow["costs_paid_usd"]),
+            "delay_survives":bool(not delay_risk_map[best_name]["hard_stopped"]),
+            "oos_zero_hard_stops":bool(gates["oos_hard_stop_window_ratio"]==0),
+            "nearby_triple_survival_ge_75pct":bool(robust_triple_ratio>=0.75),
         },
         "buy_hold":bh,"sma200_long_cash":sma,"acceptance":gates,
-        "overall_pass":bool(primary_pass),
-        "research_note":"V9.3 candidates were designed after observing V9.2 full-sample and cost-stress results. Walk-forward windows are stability checks, not pristine untouched OOS for the research program.",
+        "overall_strict_acceptance":bool(primary_pass),
+        "research_note":"V9.4 is the final V9.x fine-tuning iteration and was designed after observing V9.3 full-sample/frozen-cost results. Walk-forward windows are stability checks, not pristine untouched OOS evidence for the entire research program.",
+        "next_step_if_v94_passes":"Freeze V9.x parameters and move to futures/funding-aware validation plus paper trading; do not continue V9.x tuning.",
+        "next_step_if_v94_fails":"Stop V9.x parameter tuning. Diagnose architecture/execution model and redesign in a new major research branch; do not create V9.5 by parameter chasing.",
         "assumptions":{
             "price_source":"Binance BTCUSDT spot 1H price proxy",
             "fee_bps_per_rebalance":costs.fee_bps,
             "slippage_bps_per_rebalance":costs.slippage_bps,
             "funding_included":False,
             "signal_timing":"completed daily/4H data -> later 4H open",
-            "cost_aware_rule":"effective deadband = static deadband + cost_band_mult*(estimated one-way cost / 4H ATR fraction), capped at 14 percentage points; urgent de-risk bypasses throttle",
+            "cost_aware_rule":"effective deadband = static deadband + cost_band_mult*(estimated one-way cost / 4H ATR fraction), clipped by candidate max_effective_deadband; urgent de-risk bypasses throttle",
+            "execution_reserve_rule":"stress-independent haircut of positive model target exposure after signal/risk decision and before execution",
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
     (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
 
     lines=[
-        "# BTC AI EA V9.3 — Cost-Aware Execution Architecture","",
+        "# BTC AI EA V9.4 — Frozen-Cost Resilient Execution","",
         f"- Data: {summary['data_start']} → {summary['data_end']} ({len(data):,} 1H bars)",
         f"- Selected candidate: **{best_name}**",
+        f"- Config: cost_band_mult={best_s.cost_band_mult:.2f}, cap={pct(best_s.max_effective_deadband)}, interval={best_s.rebalance_min_interval_bars}, reserve={pct(best_s.execution_reserve)}",
         f"- Base CAGR / MDD: **{pct(bsm['cagr'])} / {pct(bsm['max_drawdown'])}**",
         f"- Base Sharpe / PF: **{bsm['sharpe_365']:.2f} / {bsm['profit_factor_daily']:.2f}**",
         f"- Rebalances / costs / turnover: **{bsm['rebalances']} / ${bsm['costs_paid_usd']:,.2f} / {bsm['gross_turnover_x_initial']:.2f}x**",
+        f"- Vs V9.2C rebalance / cost change: **{pct(summary['turnover_change_vs_v92c_control']['rebalance_pct'])} / {pct(summary['turnover_change_vs_v92c_control']['cost_pct'])}**",
         f"- Avg effective deadband: **{pct(bsm.get('avg_effective_deadband',0.0))}**",
-        f"- Cost-band skips / interval blocks / tactical re-entry blocks: **{bsm.get('cost_band_skips',0)} / {bsm.get('interval_blocks',0)} / {bsm.get('tactical_reentry_blocks',0)}**",
-        f"- V9.2C control CAGR / MDD: **{pct(control_shadow['cagr'])} / {pct(control_shadow['max_drawdown'])}**",
-        f"- V9.2C control rebalances / costs: **{control_shadow['rebalances']} / ${control_shadow['costs_paid_usd']:,.2f}**",
-        f"- Adaptive 2x-cost CAGR / MDD: **{pct(stress_shadow_map[best_name]['cagr'])} / {pct(stress_shadow_map[best_name]['max_drawdown'])}**",
-        f"- Adaptive 2x-cost hard stop: **{stress_risk_map[best_name]['hard_stopped']}**",
-        f"- Frozen-decision 2x-cost CAGR / MDD: **{pct(frozen_shadow_map[best_name]['cagr'])} / {pct(frozen_shadow_map[best_name]['max_drawdown'])}**",
-        f"- Frozen-decision 2x hard stop: **{frozen_risk_map[best_name]['hard_stopped']}**",
-        f"- V9.3 development target: **{'PASS' if v93_dev_pass else 'FAIL'}**",
+        f"- Adaptive 2x CAGR / MDD: **{pct(stress_shadow_map[best_name]['cagr'])} / {pct(stress_shadow_map[best_name]['max_drawdown'])}**; hard stop={stress_risk_map[best_name]['hard_stopped']}",
+        f"- Frozen-decision 2x CAGR / MDD: **{pct(frozen_shadow_map[best_name]['cagr'])} / {pct(frozen_shadow_map[best_name]['max_drawdown'])}**; hard stop={frozen_risk_map[best_name]['hard_stopped']}",
+        f"- +4H delay hard stop: **{delay_risk_map[best_name]['hard_stopped']}**",
+        f"- Nearby base+adaptive2x+frozen2x survival: **{pct(robust_triple_ratio)}**",
+        f"- V9.4 development target: **{'PASS' if v94_dev_pass else 'FAIL'}**",
         f"- Overall strict acceptance: **{'PASS' if primary_pass else 'FAIL'}**",
         "","## Candidate comparison","",cand.to_markdown(index=False),
-        "","## Walk-forward OOS robustness","",wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
-        "","## Execution nearby robustness","",robust.to_markdown(index=False),
+        "","## Walk-forward OOS stability","",wf.to_markdown(index=False) if not wf.empty else "Not enough windows.",
+        "","## Nearby V9.4 robustness","",robust.to_markdown(index=False),
         "","## Acceptance gates","","```json",json.dumps(gates,indent=2,default=str),"```",
         "","## Research integrity note","",summary["research_note"],
-        "","## Decision rule","",
-        "Do not deploy live unless base MDD remains below 15%, both adaptive and frozen-decision 2x-cost tests survive, +4H delay survives, OOS windows avoid hard stops, and later futures/funding-aware validation plus paper trading pass."
+        "","## V9.x stop rule","",
+        "PASS: freeze V9.x and proceed to futures/funding-aware validation and paper trading. FAIL: stop V9.x parameter tuning and redesign the architecture in a new major research branch.",
+        "","## Live-deployment rule","",
+        "Do not deploy live from this spot-proxy backtest alone. Funding, futures microstructure, exchange-specific execution and paper-trading validation are still required."
     ]
     (out/"REPORT.md").write_text("\n".join(lines))
-    print("\n=== V9.3 COMPLETE ===")
+    print("\n=== V9.4 COMPLETE ===")
     print((out/"REPORT.md").read_text())
 
 
