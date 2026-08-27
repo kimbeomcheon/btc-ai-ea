@@ -250,7 +250,47 @@ def metrics(curve: pd.DataFrame, initial: float) -> dict[str, float]:
             "max_gross_exposure": float(curve.exposure.abs().max())}
 
 
+def core_metrics(curve: pd.DataFrame, initial: float) -> dict[str, float]:
+    result = v112.metrics(curve, initial)
+    result["avg_gross_exposure"] = result["avg_exposure"]
+    result["max_gross_exposure"] = result["max_exposure"]
+    return result
+
+
+def core_execution(curve: pd.DataFrame, execution: dict, initial: float) -> dict:
+    held = curve.exposure.shift(1).fillna(0.0)
+    funding_fraction = float((held * curve.funding_rate).sum())
+    return {**execution, "cost_paid": float(execution["cost_fraction"] * initial),
+            "funding_paid": float(funding_fraction * initial),
+            "funding_fraction": funding_fraction}
+
+
+def run_core_control(x, funding, initial):
+    base_cost = v112.CostModel()
+    base, trades, hb, eb = v112.simulate(x, funding, core_strategy(), base_cost, initial, True)
+    stress = v112.CostModel(11, 4, 2)
+    adaptive, _, ha, ea = v112.simulate(x, funding, core_strategy(), stress, initial, True)
+    frozen, _, hf, ef = v112.simulate(x, funding, core_strategy(), stress, initial, False, trades)
+    delayed = x.copy()
+    signal_columns = ["regime", "rv30", "rv_ratio", "shock", "risk_fast", "risk_mid",
+                      "risk_slow", "ret5", "ret20", "dd20", "dclose", "daily_seq",
+                      "entry_hi", "exit_lo", "atr4h"]
+    delayed[signal_columns] = delayed[signal_columns].shift(1)
+    delayed = delayed.dropna(subset=signal_columns).copy()
+    delay, _, hd, ed = v112.simulate(delayed, funding, core_strategy(), base_cost, initial, True)
+    return {"base": core_metrics(base, initial), "adaptive2x": core_metrics(adaptive, initial),
+            "frozen2x": core_metrics(frozen, initial), "+4h_delay": core_metrics(delay, initial),
+            "hard_stop": {"base": hb, "adaptive2x": ha, "frozen2x": hf, "delay": hd},
+            "execution": {"base": core_execution(base, eb, initial),
+                          "adaptive2x": core_execution(adaptive, ea, initial),
+                          "frozen2x": core_execution(frozen, ef, initial),
+                          "delay": core_execution(delay, ed, initial)},
+            "_curve": base}
+
+
 def run_one(x, funding, rules, mode, initial):
+    if mode == "Core-only":
+        return run_core_control(x, funding, initial)
     base_cost = v112.CostModel()
     base, trades, hb, eb = simulate(x, funding, rules, mode, base_cost, initial, True)
     stress = v112.CostModel(11, 4, 2)
@@ -284,6 +324,8 @@ def walk_forward(x, funding, rules, mode, initial):
 
 
 def robustness(x, funding, rules, mode, initial):
+    if mode == "Core-only":
+        return v112.robustness(x, funding, core_strategy(), initial)
     variants = (("BASE", rules),
                 ("SIGNAL105", replace(rules, participation_floor=rules.participation_floor * 1.05)),
                 ("VOL95", replace(rules, vol_target=rules.vol_target * .95)),
