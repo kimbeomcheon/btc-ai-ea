@@ -42,6 +42,16 @@ jobs:
         run: |
           echo "## V12 Alpha gate scorecard" >> "$GITHUB_STEP_SUMMARY"
           python -c "import pandas as pd; print(pd.read_csv('results_v12/v12_alpha_scorecard.csv').to_markdown(index=False))" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import pandas as pd
+          scorecard = pd.read_csv("results_v12/v12_alpha_scorecard.csv")
+          fields = ["gate", "overfit_fail", "base_cagr", "base_sharpe", "base_mdd",
+                    "oos_cagr", "oos_mdd", "robustness", "turnover", "cost_paid",
+                    "funding_paid", "max_gross"]
+          for _, row in scorecard.iterrows():
+              details = ", ".join(f"{field}={row[field]}" for field in fields)
+              print(f"::notice title={row['candidate']} / {row['mode']}::{details}")
+          PY
 
       - name: Upload separated research results
         uses: actions/upload-artifact@v4
