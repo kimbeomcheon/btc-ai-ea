@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-BTC AI EA — V10.0 Cost-Admissible Futures Execution Backtester
-==============================================================
+BTC AI EA — V10.5 Hybrid Trend/Convex Futures Backtester
+==========================================================
 
-Architectural reset after V9.4:
-- Binance USD-M BTCUSDT perpetual futures price proxy (not spot).
-- Historical funding is charged to long exposure when archive data is available.
-- Signal generation and execution are separated.
-- Risk reductions always execute; new/increased risk must pass an economic
-  admission gate: expected edge must exceed round-trip friction by a fixed margin.
-- Frozen-decision 2x stress replays the exact base trades with doubled realized
-  fee/slippage, preventing cost-aware decision changes from gaming the stress.
-- No martingale, averaging-down logic, simultaneous long/short hedge, or lookahead.
+V10.5 hybrid objective:
+- Binance USD-M BTCUSDT perpetual futures price proxy with historical funding.
+- Preserve V10 frozen-decision and adaptive-cost stress integrity.
+- Restore a persistent V9-style trend core so base exposure is not blocked by a
+  short-horizon cost-admission gate.
+- Apply the economic admission gate only to tactical/convex risk additions.
+- Strong and weak bull regimes carry different core exposure.
+- Convex additions require confirmed favorable breakout continuation.
+- Risk reductions always execute immediately.
+- No martingale, averaging down, simultaneous long/short hedge, or lookahead.
 """
 
 from __future__ import annotations
@@ -42,9 +43,9 @@ class Rules:
     admission_margin: float = 1.50
     min_order_delta: float = 0.035
     hold_bars: int = 2
-    edge_horizon_bars: int = 6
-    trend_edge_weight: float = 0.18
-    breakout_edge_weight: float = 0.10
+    edge_horizon_bars: int = 42
+    trend_edge_weight: float = 0.30
+    breakout_edge_weight: float = 0.14
 
 BASE_RULES = Rules()
 
@@ -54,15 +55,18 @@ class Candidate:
     admission_margin: float
     min_order_delta: float
     hold_bars: int
+    strong_core: float = 0.30
+    weak_core: float = 0.10
+    tactical_add: float = 0.14
 
 CANDIDATES = [
-    Candidate("V10A_M150_D035_H2", 1.50, 0.035, 2),
-    Candidate("V10B_M175_D035_H2", 1.75, 0.035, 2),
-    Candidate("V10C_M150_D050_H2", 1.50, 0.050, 2),
+    Candidate("V105A_CORE30_W10", 1.50, 0.035, 2, 0.30, 0.10, 0.14),
+    Candidate("V105B_CORE28_W10", 1.50, 0.035, 2, 0.28, 0.10, 0.14),
+    Candidate("V105C_CORE30_W08", 1.75, 0.035, 2, 0.30, 0.08, 0.12),
 ]
 
 def fetch_bytes(url: str, retries: int = 3) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent":"btc-ai-ea-v10/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent":"btc-ai-ea-v10.5/1.0"})
     last = None
     for i in range(retries):
         try:
@@ -252,28 +256,44 @@ def build_features(px1h: pd.DataFrame):
                       on="time", direction="backward").set_index("time")
     return x
 
-def desired_target(r):
+def target_components(r, cand: Candidate):
     if not np.isfinite(r.slow) or not np.isfinite(r.fast):
-        return 0.0
-    bull = (r.dclose > r.slow) and (r.fast > r.slow) and (r.slow_slope > 0)
-    if not bull:
-        return 0.0
-    base = 0.26
+        return 0.0, 0.0
+    above_slow = bool(r.dclose > r.slow)
+    strong = above_slow and (r.fast > r.slow) and (r.slow_slope > 0)
+    weak = above_slow and not strong
+    if not (strong or weak):
+        return 0.0, 0.0
+
+    core = cand.strong_core if strong else cand.weak_core
     if np.isfinite(r.rv30) and r.rv30 > 0:
-        base *= float(np.clip(0.55/r.rv30,0.55,1.0))
+        core *= float(np.clip(0.55/r.rv30, 0.55, 1.0))
     if np.isfinite(r.rv_ratio) and r.rv_ratio > 1.45:
-        base *= 0.68
+        core *= 0.68
     if np.isfinite(r.ret20) and r.ret20 < -0.10:
-        base *= 0.50
+        core *= 0.50
     if np.isfinite(r.dd20) and r.dd20 < -0.15:
-        base = 0.0
-    # Convex adds only after favorable breakout.
-    if np.isfinite(r.entry_hi) and r.close > r.entry_hi:
-        strength = (r.close-r.entry_hi)/max(r.atr,1e-12)
-        if strength >= 1.4: base += 0.13
-        if strength >= 3.3: base += 0.14
-        if strength >= 5.7: base += 0.14
-    return float(np.clip(base,0,0.70))
+        return 0.0, 0.0
+
+    tactical = 0.0
+    if strong and np.isfinite(r.entry_hi) and np.isfinite(r.atr) and r.atr > 0 and r.close > r.entry_hi:
+        strength = (r.close-r.entry_hi)/r.atr
+        if strength >= 0.25:
+            tactical += cand.tactical_add
+        if strength >= 1.25:
+            tactical += 0.10
+        if strength >= 2.50:
+            tactical += 0.08
+
+    core = float(np.clip(core, 0.0, BASE_RULES.max_long))
+    tactical = float(np.clip(tactical, 0.0, BASE_RULES.max_long-core))
+    return core, tactical
+
+
+def desired_target(r, cand: Candidate):
+    core, tactical = target_components(r, cand)
+    return float(np.clip(core+tactical, 0.0, BASE_RULES.max_long))
+
 
 def expected_edge_bps(r):
     # Conservative, causal edge proxy over the planned 24h horizon.
@@ -283,7 +303,7 @@ def expected_edge_bps(r):
     breakout = 0.0
     if np.isfinite(r.entry_hi) and np.isfinite(r.atr) and r.atr > 0:
         breakout = max(0.0, (r.close-r.entry_hi)/r.atr)
-    return float(10000*(0.18*trend) + 10.0*0.10*min(breakout,6.0))
+    return float(10000*(0.30*trend) + 10.0*0.14*min(breakout,6.0))
 
 def map_funding_to_4h(index, funding: pd.Series):
     out = pd.Series(0.0,index=index)
@@ -318,7 +338,7 @@ def simulate(x, funding, cand: Candidate, cost: CostModel,
             target=0.0
             hard_stop=True
         else:
-            target=desired_target(r0)
+            target=desired_target(r0, cand)
             if dd <= -BASE_RULES.soft_drawdown:
                 target=min(target, exposure*0.5)
 
@@ -336,12 +356,20 @@ def simulate(x, funding, cand: Candidate, cost: CostModel,
             if urgent and abs(delta)>1e-12:
                 execute=True
             elif delta > 0:
-                threshold = cand.admission_margin * (2.0*one_way)
-                edge = expected_edge_bps(r0)
+                core_target, tactical_target = target_components(r0, cand)
                 enough_time = (i-last_trade_bar) >= cand.hold_bars
-                enough_size = delta >= cand.min_order_delta
-                if adaptive_cost and edge >= threshold and enough_time and enough_size:
-                    execute=True
+                if exposure + 1e-12 < core_target:
+                    core_delta = core_target - exposure
+                    if core_delta >= cand.min_order_delta and enough_time:
+                        target = core_target
+                        delta = target - exposure
+                        execute = True
+                elif tactical_target > 0:
+                    threshold = cand.admission_margin * (2.0*one_way)
+                    edge = expected_edge_bps(r0)
+                    enough_size = delta >= cand.min_order_delta
+                    if adaptive_cost and edge >= threshold and enough_time and enough_size:
+                        execute=True
             if execute:
                 turn=abs(delta)
                 eq *= max(1e-12,1.0-turn*one_way/10000.0)
@@ -389,11 +417,11 @@ def run_one(x,funding,cand,initial):
 
 def robustness(x,funding,cand,initial):
     variants=[
-        ("M125",Candidate(cand.name+"_M125",1.25,cand.min_order_delta,cand.hold_bars)),
+        ("M125",Candidate(cand.name+"_M125",1.25,cand.min_order_delta,cand.hold_bars,cand.strong_core,cand.weak_core,cand.tactical_add)),
         ("BASE",cand),
-        ("M200",Candidate(cand.name+"_M200",2.00,cand.min_order_delta,cand.hold_bars)),
-        ("D025",Candidate(cand.name+"_D025",cand.admission_margin,0.025,cand.hold_bars)),
-        ("D050",Candidate(cand.name+"_D050",cand.admission_margin,0.050,cand.hold_bars)),
+        ("M200",Candidate(cand.name+"_M200",2.00,cand.min_order_delta,cand.hold_bars,cand.strong_core,cand.weak_core,cand.tactical_add)),
+        ("D025",Candidate(cand.name+"_D025",cand.admission_margin,0.025,cand.hold_bars,cand.strong_core,cand.weak_core,cand.tactical_add)),
+        ("D050",Candidate(cand.name+"_D050",cand.admission_margin,0.050,cand.hold_bars,cand.strong_core,cand.weak_core,cand.tactical_add)),
     ]
     out=[]
     for label,v in variants:
@@ -409,7 +437,7 @@ def main():
     ap.add_argument("--start",default="2017-08-17")
     ap.add_argument("--end",default=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
     ap.add_argument("--initial",type=float,default=10000)
-    ap.add_argument("--cache",default=".cache_v10")
+    ap.add_argument("--cache",default=".cache_v105")
     ap.add_argument("--results",default="results")
     a=ap.parse_args()
     outdir=Path(a.results); outdir.mkdir(parents=True,exist_ok=True)
@@ -445,7 +473,7 @@ def main():
                 z["base"]["sharpe"] if np.isfinite(z["base"]["sharpe"]) else -99)
     selected=max(results,key=key)
     summary={
-        "version":"V10.0",
+        "version":"V10.5",
         "architecture":"cost-admissible futures execution",
         "selected":selected["candidate"]["name"],
         "development_gate_passed":selected["development_gate"],
