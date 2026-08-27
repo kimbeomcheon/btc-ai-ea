@@ -35,6 +35,10 @@ class AlphaRules:
     risk_per_trade: float = 0.015
     daily_loss_brake: float = 0.04
     weekly_loss_brake: float = 0.08
+    drawdown_throttle: float = 0.10
+    drawdown_floor: float = 0.18
+    high_vol_cut: float = 1.20
+    high_vol_scale: float = 0.60
     funding_soft: float = 0.00025
     funding_hard: float = 0.00075
     participation_floor: float = 0.75
@@ -166,6 +170,8 @@ def simulate(x: pd.DataFrame, funding: pd.Series, rules: AlphaRules, mode: str,
             risk_cap = rules.risk_per_trade / stop_pct if stop_pct > 0 else 0.0
             gross = min(alpha_gross(previous, rules), risk_cap, MAX_GROSS_EXPOSURE)
             alpha = direction * gross * funding_scale(direction, rate, rules)
+            if float(previous.rv4h) >= rules.high_vol_cut:
+                alpha *= rules.high_vol_scale
             adverse = direction * (float(previous.close) / float(entry_price) - 1.0)
             if adverse <= -stop_pct:
                 alpha = 0.0; direction = 0; entry_price = np.nan
@@ -177,6 +183,10 @@ def simulate(x: pd.DataFrame, funding: pd.Series, rules: AlphaRules, mode: str,
         desired = float(np.clip(desired, -MAX_GROSS_EXPOSURE, MAX_GROSS_EXPOSURE))
         if hard_stop or brake:
             desired = 0.0
+        elif total_dd <= -rules.drawdown_throttle:
+            width = max(rules.drawdown_floor - rules.drawdown_throttle, 1e-9)
+            throttle = np.clip((rules.drawdown_floor + total_dd) / width, 0.0, 1.0)
+            desired *= float(throttle)
 
         # No averaging down: same-direction gross may only increase after a
         # favorable move from the campaign entry.
@@ -221,15 +231,19 @@ def simulate(x: pd.DataFrame, funding: pd.Series, rules: AlphaRules, mode: str,
 
 def metrics(curve: pd.DataFrame, initial: float) -> dict[str, float]:
     if curve.empty:
-        return {key: float("nan") for key in ("cagr", "mdd", "sharpe", "final",
+        return {key: float("nan") for key in ("cagr", "mdd", "sharpe", "pf", "final",
                                                 "exposure_time", "avg_exposure",
                                                 "avg_gross_exposure", "max_gross_exposure")}
     years = max((curve.index[-1] - curve.index[0]).total_seconds() / (365.25 * 86400), 1e-9)
     final = float(curve.equity.iloc[-1])
     returns = curve.equity.pct_change().dropna()
     sharpe = float(returns.mean() / returns.std() * np.sqrt(6 * 365)) if len(returns) > 2 and returns.std() > 0 else np.nan
+    gains = float(returns[returns > 0].sum())
+    losses = float(-returns[returns < 0].sum())
+    profit_factor = gains / losses if losses > 0 else np.nan
     return {"cagr": (final / initial) ** (1 / years) - 1.0,
-            "mdd": float(curve.drawdown.min()), "sharpe": sharpe, "final": final,
+            "mdd": float(curve.drawdown.min()), "sharpe": sharpe, "pf": profit_factor,
+            "final": final,
             "exposure_time": float((curve.exposure.abs() > 1e-12).mean()),
             "avg_exposure": float(curve.exposure.mean()),
             "avg_gross_exposure": float(curve.exposure.abs().mean()),
@@ -270,12 +284,13 @@ def walk_forward(x, funding, rules, mode, initial):
 
 
 def robustness(x, funding, rules, mode, initial):
-    variants = (("VOL90", replace(rules, vol_target=rules.vol_target * .9)),
-                ("BASE", rules),
-                ("VOL110", replace(rules, vol_target=rules.vol_target * 1.1,
-                                    max_gross=min(MAX_GROSS_EXPOSURE, rules.max_gross * 1.05))),
-                ("STOP90", replace(rules, stop_atr=rules.stop_atr * .9)),
-                ("STOP110", replace(rules, stop_atr=rules.stop_atr * 1.1)))
+    variants = (("BASE", rules),
+                ("SIGNAL105", replace(rules, participation_floor=rules.participation_floor * 1.05)),
+                ("VOL95", replace(rules, vol_target=rules.vol_target * .95)),
+                ("CAP95", replace(rules, max_gross=rules.max_gross * .95)),
+                ("REBALANCE110", replace(rules, rebalance_deadband=rules.rebalance_deadband * 1.10)),
+                ("RISK95", replace(rules, risk_per_trade=rules.risk_per_trade * .95,
+                                   drawdown_throttle=rules.drawdown_throttle * .95)))
     rows = []
     for label, variant in variants:
         result = run_one(x, funding, variant, mode, initial)
@@ -299,6 +314,16 @@ def overfit_check(base, oos, walk):
         reasons.append("fewer than two positive walk-forward folds")
     return {"failed": bool(reasons), "reasons": reasons, "base_oos_cagr_gap": gap,
             "positive_walk_forward_folds": positive_folds}
+
+
+def selection_key(row):
+    stress_mdd = min(row["adaptive2x"]["mdd"], row["frozen2x"]["mdd"],
+                     row["+4h_delay"]["mdd"])
+    turnover = row["execution"]["base"]["turnover"]
+    return (int(row["development_gate"]), int(row["oos"]["base"]["mdd"] > -HARD_DRAWDOWN),
+            row["oos"]["base"]["mdd"], row["robustness_pass_rate"],
+            row["base"]["sharpe"] if np.isfinite(row["base"]["sharpe"]) else -np.inf,
+            stress_mdd, row["oos"]["base"]["cagr"], -turnover)
 
 
 def main():
@@ -343,7 +368,10 @@ def main():
             safe_mode = mode.lower().replace("-", "_")
             base["_curve"].to_csv(output / f"{rules.name}_{safe_mode}_equity.csv")
 
+    selected_by_mode = {mode: max((row for row in all_results if row["mode"] == mode),
+                                  key=selection_key)["candidate"]["name"] for mode in MODES}
     summary = {"version": VERSION, "research_only": True, "max_gross_exposure": MAX_GROSS_EXPOSURE,
+               "selected_by_mode": selected_by_mode,
                "development_gate": {"oos_cagr_min": .20, "oos_mdd_gt": -.20,
                                     "base_sharpe_min": 1.0, "stress_mdd_gt": -.20,
                                     "robustness_min": .60, "hard_stop": False,
@@ -354,6 +382,7 @@ def main():
     flat = [{"candidate": row["candidate"]["name"], "mode": row["mode"],
              "gate": row["development_gate"], "overfit_fail": row["overfit_check"]["failed"],
              "base_cagr": row["base"]["cagr"], "base_sharpe": row["base"]["sharpe"],
+             "base_pf": row["base"]["pf"],
              "base_mdd": row["base"]["mdd"], "oos_cagr": row["oos"]["base"]["cagr"],
              "oos_mdd": row["oos"]["base"]["mdd"], "robustness": row["robustness_pass_rate"],
              "turnover": row["execution"]["base"]["turnover"],
