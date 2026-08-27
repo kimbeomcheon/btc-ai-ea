@@ -37,6 +37,12 @@ jobs:
       - name: Run V12 alpha research
         run: python v12_backtest.py --start 2019-09-08 --initial 10000
 
+      - name: Publish gate scorecard
+        shell: bash
+        run: |
+          echo "## V12 Alpha gate scorecard" >> "$GITHUB_STEP_SUMMARY"
+          python -c "import pandas as pd; print(pd.read_csv('results_v12/v12_alpha_scorecard.csv').to_markdown(index=False))" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload separated research results
         uses: actions/upload-artifact@v4
         with:
