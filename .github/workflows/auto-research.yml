@@ -30,8 +30,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run integrated V2 baseline
         run: python backtest.py --start 2017-08-17 --initial 10000
-      - name: Search limited Turtle pyramids
-        run: python auto_research.py
+      - name: Search causal limited Turtle pyramids
+        run: python auto_research.py --results results --output results_auto
       - name: Upload research results
         uses: actions/upload-artifact@v4
         with:

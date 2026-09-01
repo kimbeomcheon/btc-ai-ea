@@ -1928,7 +1928,7 @@ def main():
             "martingale":False,"averaging_down":False,"simultaneous_hedge":False,
         }
     }
-    (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str))
+    (out/"summary.json").write_text(json.dumps(summary,indent=2,default=str), encoding="utf-8")
 
     lines=[
         "# BTC AI EA V9.2 — Turnover-Controlled Convex","",
@@ -1975,9 +1975,9 @@ def main():
         "Do not deploy live unless V9.2 keeps full-sample MDD under 15%, survives 2x transaction costs and +4H delay, OOS windows do not "
         "trigger the hard stop, and futures/funding-aware validation plus paper trading pass."
     ]
-    (out/"REPORT.md").write_text("\n".join(lines))
+    (out/"REPORT.md").write_text("\n".join(lines), encoding="utf-8")
     print("\n=== V9.2 COMPLETE ===")
-    print((out/"REPORT.md").read_text())
+    print((out/"REPORT.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
