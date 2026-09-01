@@ -1,0 +1,43 @@
+name: BTC Auto High-CAGR Research
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 1 * * *"  # 10:10 KST daily
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btc-auto-high-cagr-research
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+        with:
+          ref: v13-decision-engine
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Run integrated V2 baseline
+        run: python backtest.py --start 2017-08-17 --initial 10000
+      - name: Search limited Turtle pyramids
+        run: python auto_research.py
+      - name: Upload research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-auto-high-cagr-research
+          path: |
+            results/INTEGRATED_V2_COMPARISON.csv
+            results_auto/
+          if-no-files-found: error
+          retention-days: 30
