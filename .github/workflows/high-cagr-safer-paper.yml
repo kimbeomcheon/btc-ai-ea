@@ -1,0 +1,63 @@
+name: BTC High-CAGR SAFER Dry-Run Paper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */4 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: btc-high-cagr-safer-paper
+  cancel-in-progress: false
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout frozen research branch
+        uses: actions/checkout@v4
+        with:
+          ref: v13-decision-engine
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Safety and causality self-test
+        run: python high_cagr_safer_paper.py --self-test
+
+      - name: Restore latest successful SAFER paper state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p paper_state_high_cagr_safer
+          run_id="$(gh run list --workflow high-cagr-safer-paper.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --name high-cagr-safer-paper-state --dir paper_state_high_cagr_safer
+          else
+            echo "No prior SAFER paper artifact; starting from initial equity."
+          fi
+
+      - name: Run public-data SAFER paper trader
+        run: python high_cagr_safer_paper.py --state-dir paper_state_high_cagr_safer --lookback-days 800
+
+      - name: Upload SAFER paper state
+        uses: actions/upload-artifact@v4
+        with:
+          name: high-cagr-safer-paper-state
+          path: |
+            paper_state_high_cagr_safer/state.json
+            paper_state_high_cagr_safer/report.json
+          if-no-files-found: error
+          retention-days: 90
