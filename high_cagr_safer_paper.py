@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """HIGH_CAGR_FUNDING_AWARE_SAFER_V1 — public-data DRY-RUN paper only."""
 from __future__ import annotations
-import argparse, inspect, json, math
+import argparse, inspect, json, math, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import backtest
-from paper_trader import fetch_klines, fetch_funding, KLINE_PATH, FUNDING_PATH
+from paper_trader import KLINE_PATH, FUNDING_PATH
 
 MODE="DRY_RUN_PAPER_ONLY"; STRATEGY="HIGH_CAGR_FUNDING_AWARE_SAFER_V1"
 BASE="V92C_COOLDOWN2"; INIT=10000.0; FEE=5.5; SLIP=2.0
 SP=0.65; ERTH=0.045; SOFT=0.10; ADD=1.70; CAP=1.12
 FWIN=2; FTH=0.00048; FSCALE=0.0
+BYBIT_PUBLIC_BASES=("https://api.bybit.com","https://api.bytick.com")
+BINANCE_DATA_BASE="https://data-api.binance.vision"
 
 
 def iso(t):
@@ -21,6 +23,109 @@ def iso(t):
 
 def fnum(x, default=0.0):
     x=float(x); return x if math.isfinite(x) else default
+
+def _json_get(url, retries=2):
+    last=None
+    req=urllib.request.Request(url,headers={"Accept":"application/json","User-Agent":"btc-ai-ea-safer-paper/1.2"},method="GET")
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req,timeout=30) as resp:
+                return json.loads(resp.read())
+        except Exception as exc:
+            last=exc
+            if attempt+1<retries: time.sleep(1.0*(attempt+1))
+    raise RuntimeError(f"public request failed: {url}: {last}")
+
+def bybit_public_get(path, params, retries=2):
+    if path not in (KLINE_PATH,FUNDING_PATH):
+        raise RuntimeError(f"non-public or unsupported Bybit endpoint: {path}")
+    query=urllib.parse.urlencode(params); errors=[]
+    for base in BYBIT_PUBLIC_BASES:
+        req=urllib.request.Request(f"{base}{path}?{query}",
+          headers={"Accept":"application/json","User-Agent":"btc-ai-ea-safer-paper/1.2"},method="GET")
+        for attempt in range(retries):
+            try:
+                with urllib.request.urlopen(req,timeout=30) as resp:
+                    payload=json.loads(resp.read())
+                if payload.get("retCode")!=0:
+                    raise RuntimeError(f"Bybit error {payload.get('retCode')}: {payload.get('retMsg')}")
+                return payload,base
+            except Exception as exc:
+                errors.append(f"{base}: {type(exc).__name__}: {exc}")
+                if attempt+1<retries: time.sleep(1.0*(attempt+1))
+    raise RuntimeError(f"Bybit public request failed on all official mainnet hosts: {path}: {' | '.join(errors[-4:])}")
+
+def fetch_bybit_klines(start,end):
+    start_ms=int(start.timestamp()*1000); cursor=int(end.timestamp()*1000)
+    rows=[]; source=None
+    while cursor>=start_ms:
+        payload,base=bybit_public_get(KLINE_PATH,{"category":"linear","symbol":"BTCUSDT","interval":"60",
+          "start":start_ms,"end":cursor,"limit":1000})
+        source=base; page=payload["result"].get("list",[])
+        if not page: break
+        rows.extend(page); oldest=min(int(r[0]) for r in page)
+        if oldest<=start_ms: break
+        cursor=oldest-1
+    if not rows: raise RuntimeError("Bybit returned no BTCUSDT linear klines")
+    frame=pd.DataFrame(rows,columns=["time","open","high","low","close","volume","turnover"])
+    frame["time"]=pd.to_datetime(pd.to_numeric(frame.time),unit="ms",utc=True)
+    for col in ("open","high","low","close","volume"):
+        frame[col]=pd.to_numeric(frame[col],errors="coerce")
+    frame=frame.set_index("time")[["open","high","low","close","volume"]]
+    frame=frame[~frame.index.duplicated(keep="last")].sort_index().dropna()
+    return frame.loc[(frame.index>=start)&(frame.index<=end)],source
+
+def fetch_binance_spot_klines(start,end):
+    # Public market-data-only endpoint; no authentication and no trading endpoints.
+    start_ms=int(start.timestamp()*1000); end_ms=int(end.timestamp()*1000); cursor=start_ms
+    rows=[]
+    while cursor<=end_ms:
+        q=urllib.parse.urlencode({"symbol":"BTCUSDT","interval":"1h","startTime":cursor,"endTime":end_ms,"limit":1000})
+        page=_json_get(f"{BINANCE_DATA_BASE}/api/v3/klines?{q}")
+        if not page: break
+        rows.extend(page)
+        newest=max(int(r[0]) for r in page)
+        nxt=newest+3600000
+        if nxt<=cursor: break
+        cursor=nxt
+        if len(page)<1000: break
+    if not rows: raise RuntimeError("Binance market-data-only endpoint returned no BTCUSDT klines")
+    frame=pd.DataFrame(rows)
+    frame=frame.iloc[:,:6]
+    frame.columns=["time","open","high","low","close","volume"]
+    frame["time"]=pd.to_datetime(pd.to_numeric(frame.time),unit="ms",utc=True)
+    for col in ("open","high","low","close","volume"):
+        frame[col]=pd.to_numeric(frame[col],errors="coerce")
+    frame=frame.set_index("time")[["open","high","low","close","volume"]]
+    frame=frame[~frame.index.duplicated(keep="last")].sort_index().dropna()
+    return frame.loc[(frame.index>=start)&(frame.index<=end)],BINANCE_DATA_BASE
+
+def fetch_public_klines(start,end):
+    try:
+        return fetch_bybit_klines(start,end)
+    except Exception as bybit_error:
+        frame,source=fetch_binance_spot_klines(start,end)
+        # Price fallback is allowed for paper continuity only. Source is always disclosed.
+        return frame,source+" (price fallback; Bybit REST unavailable)"
+
+def fetch_public_funding(start,end):
+    # Funding remains Bybit-specific: never silently substitute another exchange's funding.
+    start_ms=int(start.timestamp()*1000); cursor=int(end.timestamp()*1000)
+    obs=[]; source=None
+    while cursor>=start_ms:
+        payload,base=bybit_public_get(FUNDING_PATH,{"category":"linear","symbol":"BTCUSDT",
+          "endTime":cursor,"limit":200})
+        source=base; page=payload["result"].get("list",[])
+        if not page: break
+        parsed=[(int(r["fundingRateTimestamp"]),float(r["fundingRate"])) for r in page]
+        obs.extend((ts,rate) for ts,rate in parsed if ts>=start_ms)
+        oldest=min(ts for ts,_ in parsed)
+        if oldest<=start_ms: break
+        cursor=oldest-1
+    if not obs: return pd.Series(dtype=float),source
+    s=pd.Series([rate for _,rate in obs],
+      index=pd.to_datetime([ts for ts,_ in obs],unit="ms",utc=True),dtype=float)
+    return s[~s.index.duplicated(keep="last")].sort_index(),source
 
 def base_strategy():
     m=[s for s in backtest.CANDIDATES if s.name==BASE]
@@ -121,7 +226,7 @@ def update(prev,sig,fund):
 def self_test():
     idx=pd.date_range("2026-01-01",periods=6,freq="4h",tz="UTC"); f=pd.Series([.0005,.0005],index=[idx[0],idx[2]])
     z=funding_feature(f,idx); assert not(z.iloc[2]>FTH) and z.iloc[3]>FTH
-    src=inspect.getsource(fetch_klines)+inspect.getsource(fetch_funding)
+    src=inspect.getsource(bybit_public_get)+inspect.getsource(fetch_bybit_klines)+inspect.getsource(fetch_binance_spot_klines)+inspect.getsource(fetch_public_funding)
     for q in ("/v5/order","/v5/position","/v5/account","/v5/execution"): assert q not in src
     print("SELF_TEST_PASS")
 
@@ -130,8 +235,8 @@ def main():
     if a.self_test: self_test(); return
     if a.lookback_days<600: raise ValueError("lookback must be >=600 days")
     d=Path(a.state_dir); d.mkdir(parents=True,exist_ok=True); spath=d/"state.json"; prev=load_state(spath)
-    now=pd.Timestamp.now(tz="UTC"); t=now.floor("4h"); raw=fetch_klines(t-pd.Timedelta(days=a.lookback_days),now.floor("1h")); fund=fetch_funding(t-pd.Timedelta(days=a.lookback_days),now)
+    now=pd.Timestamp.now(tz="UTC"); t=now.floor("4h"); raw,price_source=fetch_public_klines(t-pd.Timedelta(days=a.lookback_days),now.floor("1h")); fund,funding_source=fetch_public_funding(t-pd.Timedelta(days=a.lookback_days),now)
     sig=signal(raw,fund,t)
     if sig["stale"]: raise RuntimeError(f"stale signal {sig['timestamp']} vs {t}")
-    st,rep=update(prev,sig,fund); spath.write_text(json.dumps(st,indent=2,allow_nan=False)); (d/"report.json").write_text(json.dumps(rep,indent=2,allow_nan=False)); print(json.dumps(rep,indent=2,allow_nan=False))
+    st,rep=update(prev,sig,fund); rep["price_data_source"]=price_source; rep["funding_data_source"]=funding_source; rep["bybit_public_hosts_tried"]=list(BYBIT_PUBLIC_BASES); spath.write_text(json.dumps(st,indent=2,allow_nan=False)); (d/"report.json").write_text(json.dumps(rep,indent=2,allow_nan=False)); print(json.dumps(rep,indent=2,allow_nan=False))
 if __name__=="__main__": main()
