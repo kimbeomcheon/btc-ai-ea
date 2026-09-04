@@ -44,19 +44,19 @@ jobs:
           cache: "pip"
 
       - name: Install requirements
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -command ". '{0}'"
         run: python -m pip install -r requirements.txt
 
       - name: Safety and causality self-test
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -command ". '{0}'"
         run: python high_cagr_safer_paper_selfhosted.py --self-test
 
       - name: Prepare persistent SAFER state directory
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -command ". '{0}'"
         run: New-Item -ItemType Directory -Force -Path $env:SAFER_STATE_DIR | Out-Null
 
       - name: Run Korea self-hosted public-data SAFER paper trader
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -command ". '{0}'"
         run: python high_cagr_safer_paper_selfhosted.py --state-dir "$env:SAFER_STATE_DIR" --lookback-days 800
 
       - name: Upload SAFER paper state
