@@ -4,6 +4,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "23 */4 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/high-cagr-safer-paper.yml"
 
 permissions:
   contents: read
@@ -15,8 +20,10 @@ concurrency:
 
 jobs:
   paper:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64, korea, safer-paper]
     timeout-minutes: 25
+    env:
+      SAFER_STATE_DIR: 'C:\actions-runner-safer\safer_state'
 
     steps:
       - name: Checkout frozen research branch
@@ -31,33 +38,28 @@ jobs:
           cache: "pip"
 
       - name: Install requirements
-        run: pip install -r requirements.txt
+        shell: pwsh
+        run: python -m pip install -r requirements.txt
 
       - name: Safety and causality self-test
-        run: python high_cagr_safer_paper.py --self-test
+        shell: pwsh
+        run: python high_cagr_safer_paper_selfhosted.py --self-test
 
-      - name: Restore latest successful SAFER paper state
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          mkdir -p paper_state_high_cagr_safer
-          run_id="$(gh run list --workflow high-cagr-safer-paper.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-          if [ -n "$run_id" ]; then
-            gh run download "$run_id" --name high-cagr-safer-paper-state --dir paper_state_high_cagr_safer
-          else
-            echo "No prior SAFER paper artifact; starting from initial equity."
-          fi
+      - name: Prepare persistent SAFER state directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:SAFER_STATE_DIR | Out-Null
 
-      - name: Run public-data SAFER paper trader
-        run: python high_cagr_safer_paper.py --state-dir paper_state_high_cagr_safer --lookback-days 800
+      - name: Run Korea self-hosted public-data SAFER paper trader
+        shell: pwsh
+        run: python high_cagr_safer_paper_selfhosted.py --state-dir "$env:SAFER_STATE_DIR" --lookback-days 800
 
       - name: Upload SAFER paper state
         uses: actions/upload-artifact@v4
         with:
           name: high-cagr-safer-paper-state
           path: |
-            paper_state_high_cagr_safer/state.json
-            paper_state_high_cagr_safer/report.json
+            C:\actions-runner-safer\safer_state\state.json
+            C:\actions-runner-safer\safer_state\report.json
+            C:\actions-runner-safer\safer_state\funding_cache.csv
           if-no-files-found: error
           retention-days: 90
