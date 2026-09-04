@@ -31,6 +31,12 @@ jobs:
         with:
           ref: v13-decision-engine
 
+      - name: Allow PowerShell scripts for runner user
+        shell: powershell -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
+          Write-Host "CurrentUser execution policy set to Bypass for GitHub runner only."
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
